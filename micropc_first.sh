@@ -9,7 +9,7 @@ echo "[+] Updating Production Scanner (segment=$SEGMENT)"
 
 if [[ $EUID -ne 0 ]]; then echo "Run as sudo"; exit 1; fi
 
-# Модель платы
+# Модель
 MODEL=$(cat /proc/device-tree/model 2>/dev/null || echo "Unknown")
 if [[ "$MODEL" == *"Orange Pi Zero 2W"* ]]; then
   MODEL="Zero2W"
@@ -37,7 +37,6 @@ else
   done
 fi
 
-# CPU сервис (перезапись)
 cat > /etc/systemd/system/cpu-limit.service <<EOF
 [Unit]
 Description=Limit CPU frequency
@@ -47,7 +46,7 @@ After=multi-user.target
 Type=oneshot
 ExecStart=/usr/bin/cpupower frequency-set -g performance || true
 ExecStart=/usr/bin/cpupower frequency-set --max $((MAX_FREQ / 1000))MHz || true
-ExecStart=/bin/bash -c 'for cpu in /sys/devices/system/cpu/cpu[0-9]*; do echo performance > \$cpu/cpufreq/scaling_governor 2>/dev/null; echo $MAX_FREQ > \$cpu/cpufreq/scaling_max_freq 2>/dev/null; done'
+ExecStart=/bin/bash -c 'for cpu in /sys/devices/system/cpu/cpu[0-9]*; do echo performance > \$cpu/cpufreq/scaling_governor 2>/dev/null || true; echo $MAX_FREQ > \$cpu/cpufreq/scaling_max_freq 2>/dev/null || true; done'
 RemainAfterExit=yes
 
 [Install]
@@ -56,21 +55,25 @@ EOF
 systemctl daemon-reload
 systemctl enable --now cpu-limit.service
 
-### Overlays (usb0-device для gadget)
+### Overlays
 REBOOT_NEEDED=0
 if [[ -f /boot/armbianEnv.txt ]]; then
   if ! grep -q "usb0-device" /boot/armbianEnv.txt; then
-    sed -i '/^overlays=/ s/$/ usb0-device/' /boot/armbianEnv.txt || echo "overlays=usb0-device" >> /boot/armbianEnv.txt
+    if grep -q "^overlays=" /boot/armbianEnv.txt; then
+      sed -i '/^overlays=/ s/$/ usb0-device/' /boot/armbianEnv.txt
+    else
+      echo "overlays=usb0-device" >> /boot/armbianEnv.txt
+    fi
     REBOOT_NEEDED=1
   fi
 fi
-modprobe libcomposite configfs || true  # Без UDC_MOD
+modprobe libcomposite configfs || true
 
 if [[ $REBOOT_NEEDED -eq 1 ]]; then
-  echo "[!] Reboot REQUIRED for gadget mode!"
+  echo "[!] Reboot REQUIRED for USB gadget mode!"
 fi
 
-### HID setup (перезапись, без sunxi_udc)
+### HID setup (перезапись)
 cat > /usr/local/bin/setup_hid.sh <<'EOF'
 #!/bin/bash
 set -u
@@ -112,20 +115,20 @@ exit 0
 EOF
 chmod +x /usr/local/bin/setup_hid.sh
 
-### Udev rules (перезапись)
+### Udev
 cat > /etc/udev/rules.d/99-production-scanner.rules <<'EOF'
 SUBSYSTEM=="input", KERNEL=="event*", MODE="0660", GROUP="plugdev"
 EOF
 udevadm control --reload || true
 
-### Python (перезапись, фикс evdev + полный keymap)
-cat > /opt/production_scanner.py <<EOF
+### Python (quoted heredoc для кавычек)
+cat > /opt/production_scanner.py <<'EOF'
 #!/usr/bin/env python3
 import evdev
 from evdev import ecodes
 import os
 
-SEGMENT = $SEGMENT
+SEGMENT = SEGMENT_PLACEHOLDER
 HID = "/dev/hidg0"
 
 KEYMAP = {
@@ -160,7 +163,7 @@ def send(text):
 
 paths = evdev.list_devices()
 if not paths:
-    print("No input devices")
+    print("No input devices found")
     os._exit(1)
 
 devices = [evdev.InputDevice(p) for p in paths]
@@ -170,10 +173,10 @@ buf = ""
 shift = False
 for event in dev.read_loop():
     if event.type == ecodes.EV_KEY:
-        if event.code in [42, 54]:  # Shift
+        if event.code in [42, 54]:
             shift = (event.value == 1)
             continue
-        if event.value == 1:  # Key down
+        if event.value == 1:
             key_name = ecodes.KEY[event.code].replace('KEY_', '').lower()
             char = key_name.upper() if shift and key_name.isalpha() else key_name
             if char in ['enter', 'kpenter']:
@@ -185,9 +188,12 @@ for event in dev.read_loop():
             else:
                 buf += char
 EOF
+
+# Замена placeholder
+sed -i "s/SEGMENT_PLACEHOLDER/$SEGMENT/" /opt/production_scanner.py
 chmod +x /opt/production_scanner.py
 
-### Systemd (перезапись)
+### Systemd
 cat > /etc/systemd/system/hid-gadget.service <<'EOF'
 [Unit]
 Description=USB HID Gadget
@@ -222,4 +228,4 @@ systemctl daemon-reload
 systemctl enable --now hid-gadget.service production-scanner.service
 
 echo "[✓] UPDATE COMPLETE"
-[[ $REBOOT_NEEDED -eq 1 ]] && echo "[!] REBOOT NOW for USB gadget!"
+[[ $REBOOT_NEEDED -eq 1 ]] && echo "[!] REBOOT NOW for full USB gadget support!"
