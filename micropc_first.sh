@@ -59,7 +59,9 @@ After=multi-user.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'if command -v cpupower >/dev/null; then cpupower frequency-set -g performance; cpupower frequency-set --max MAX_FREQ_MHZMHz; else for cpu in /sys/devices/system/cpu/cpu[0-9]*; do echo "performance" > $cpu/cpufreq/scaling_governor; echo MAX_FREQ > $cpu/cpufreq/scaling_max_freq; done; fi'
+ExecStart=/usr/bin/cpupower frequency-set -g performance || true
+ExecStart=/usr/bin/cpupower frequency-set --max MAX_FREQ_MHZMHz || true
+ExecStart=/bin/bash -c 'for cpu in /sys/devices/system/cpu/cpu[0-9]*; do echo "performance" > $cpu/cpufreq/scaling_governor 2>/dev/null || true; echo MAX_FREQ > $cpu/cpufreq/scaling_max_freq 2>/dev/null || true; done'
 RemainAfterExit=yes
 
 [Install]
@@ -68,8 +70,7 @@ EOF
   sed -i "s/MAX_FREQ_MHZ/$((MAX_FREQ / 1000))/" "$CPU_SERVICE"
   sed -i "s/MAX_FREQ/$MAX_FREQ/" "$CPU_SERVICE"
   systemctl daemon-reload
-  systemctl enable cpu-limit.service
-  systemctl start cpu-limit.service
+  systemctl enable --now cpu-limit.service
 fi
 
 ### ─────────────────────────────
