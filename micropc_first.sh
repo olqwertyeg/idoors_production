@@ -28,7 +28,7 @@ echo "[+] Model: $MODEL, target CPU max: $((MAX_FREQ/1000)) MHz"
 
 ### Пакеты
 apt-get update
-for pkg in python3 python3-evdev usbutils linux-cpupower device-tree-compiler logrotate; do
+for pkg in python3 python3-evdev usbutils linux-cpupower device-tree-compiler logrotate python3-systemd; do
   if ! dpkg -s "$pkg" >/dev/null 2>&1; then
     apt-get install -y "$pkg"
   fi
@@ -51,7 +51,7 @@ else
   echo "[+] CPU limit already applied or lower (current: $((CURRENT_MAX/1000)) MHz)"
 fi
 
-# CPU service (overwrite)
+# CPU service
 cat > /etc/systemd/system/cpu-limit.service <<EOF
 [Unit]
 Description=Limit CPU frequency
@@ -174,6 +174,7 @@ cat > /opt/production_scanner.py <<'EOF'
 import evdev
 from evdev import ecodes
 import os
+import systemd.daemon
 
 def log(msg):
     with open('/var/log/production_scanner.log', 'a') as f:
@@ -228,7 +229,9 @@ log(f"Using: {dev.name} ({dev.path})")
 
 buf = ""
 shift = False
+systemd.daemon.notify('READY=1')  # Notify service ready
 for event in dev.read_loop():
+    systemd.daemon.notify('WATCHDOG=1')  # Ping watchdog
     if event.type == ecodes.EV_KEY:
         log(f"Event: code {event.code} value {event.value}")
         if event.code in [42, 54]:
@@ -250,7 +253,7 @@ EOF
 sed -i "s/__SEGMENT__/$SEGMENT/" /opt/production_scanner.py
 chmod +x /opt/production_scanner.py
 
-### Systemd services (fix ExecStartPre)
+### Systemd
 cat > /etc/systemd/system/hid-gadget.service <<'EOF'
 [Unit]
 Description=USB HID Gadget
