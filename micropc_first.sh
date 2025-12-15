@@ -1,136 +1,178 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
+
 SEGMENT="${1:-1}"
-BASE="/opt/production-scanner"
-CONF="/etc/production-scanner"
+[[ "$SEGMENT" =~ ^[0-2]$ ]] || { echo "SEGMENT must be 0,1,2"; exit 1; }
 
+LOG=/var/log/production-scanner-install.log
+exec > >(tee -a "$LOG") 2>&1
 
-apt update
-apt install -y python3 python3-evdev usbutils systemd
+echo "[+] Installing Production Scanner (segment=$SEGMENT)"
 
+### ─────────────────────────────
+### Packages
+### ─────────────────────────────
+apt-get update
+apt-get install -y \
+  python3 \
+  python3-evdev \
+  usbutils \
+  systemd \
+  udev
 
-mkdir -p "$BASE" "$CONF"
-
-
-cat > "$CONF/config.env" <<EOF
-SEGMENT=$SEGMENT
-HID_OUT=/dev/hidg0
-EOF
-
-
-# ---------- HID SETUP ----------
-cat > /usr/local/bin/setup_hid.sh <<'EOF'
+### ─────────────────────────────
+### HID gadget setup script
+### ─────────────────────────────
+cat >/usr/local/bin/setup_hid.sh <<'EOF'
 #!/bin/bash
 set -e
+
 G=/sys/kernel/config/usb_gadget/hid_keyboard
-[[ -e $G/UDC ]] && exit 0
+UDC=$(ls /sys/class/udc | head -n1)
+
 modprobe libcomposite configfs || true
 mountpoint -q /sys/kernel/config || mount -t configfs none /sys/kernel/config
-mkdir -p $G && cd $G
+
+if [ -d "$G" ]; then
+  [ -s "$G/UDC" ] && echo "" >"$G/UDC"
+else
+  mkdir -p "$G"
+fi
+
+cd "$G"
+
 echo 0x1d6b > idVendor
 echo 0x0104 > idProduct
+
 mkdir -p strings/0x409
 echo Production > strings/0x409/manufacturer
 echo QR-Scanner > strings/0x409/product
 echo 0001 > strings/0x409/serialnumber
+
 mkdir -p configs/c.1/strings/0x409
 echo HID > configs/c.1/strings/0x409/configuration
 echo 250 > configs/c.1/MaxPower
+
 mkdir -p functions/hid.usb0
 echo 1 > functions/hid.usb0/protocol
 echo 1 > functions/hid.usb0/subclass
 echo 8 > functions/hid.usb0/report_length
-echo -ne '\x05\x01\x09\x06\xa1\x01\x05\x07\x19\xe0\x29\xe7\x15\x00\x25\x01\x75\x01\x95\x08\x81\x02\x95\x01\x75\x08\x81\x03\x95\x05\x75\x01\x05\x08\x19\x01\x29\x05\x91\x02\x95\x01\x75\x03\x91\x03\x95\x06\x75\x08\x15\x00\x25\x65\x05\x07\x19\x00\x29\x65\x81\x00\xc0' > functions/hid.usb0/report_desc
-ln -s functions/hid.usb0 configs/c.1/
-for u in /sys/class/udc/*; do echo "$(basename $u)" > UDC && break; done
+
+# USB HID Keyboard descriptor (HUT 1.12)
+echo -ne '\
+\x05\x01\x09\x06\xa1\x01\x05\x07\
+\x19\xe0\x29\xe7\x15\x00\x25\x01\x75\x01\x95\x08\x81\x02\
+\x95\x01\x75\x08\x81\x03\
+\x95\x05\x75\x01\x05\x08\x19\x01\x29\x05\x91\x02\
+\x95\x01\x75\x03\x91\x03\
+\x95\x06\x75\x08\x15\x00\x25\x65\x05\x07\x19\x00\x29\x65\x81\x00\
+\xc0' > functions/hid.usb0/report_desc
+
+ln -sf functions/hid.usb0 configs/c.1/
+
+echo "$UDC" > UDC
 EOF
+
 chmod +x /usr/local/bin/setup_hid.sh
 
-
-# ---------- UDEV (нестандартные сканеры) ----------
-cat > /etc/udev/rules.d/99-production-scanner.rules <<'EOF'
-SUBSYSTEM=="input", ATTRS{idVendor}=="*", ATTRS{idProduct}=="*", ENV{ID_INPUT_KEYBOARD}="1"
-EOF
-udevadm control --reload-rules
-
-
-# ---------- KEYMAP (USB HID 1.12) ----------
-cat > "$BASE/hid_usage.py" <<'EOF'
-# USB HID Usage Table 1.12 (Keyboard Page 0x07)
-CHAR_TO_HID = {
-'a':(0x04,0),'b':(0x05,0),'c':(0x06,0),'d':(0x07,0),'e':(0x08,0),'f':(0x09,0),'g':(0x0A,0),'h':(0x0B,0),'i':(0x0C,0),'j':(0x0D,0),'k':(0x0E,0),'l':(0x0F,0),'m':(0x10,0),'n':(0x11,0),'o':(0x12,0),'p':(0x13,0),'q':(0x14,0),'r':(0x15,0),'s':(0x16,0),'t':(0x17,0),'u':(0x18,0),'v':(0x19,0),'w':(0x1A,0),'x':(0x1B,0),'y':(0x1C,0),'z':(0x1D,0),
-'A':(0x04,0x02),'B':(0x05,0x02),'C':(0x06,0x02),'D':(0x07,0x02),'E':(0x08,0x02),'F':(0x09,0x02),'G':(0x0A,0x02),'H':(0x0B,0x02),'I':(0x0C,0x02),'J':(0x0D,0x02),'K':(0x0E,0x02),'L':(0x0F,0x02),'M':(0x10,0x02),'N':(0x11,0x02),'O':(0x12,0x02),'P':(0x13,0x02),'Q':(0x14,0x02),'R':(0x15,0x02),'S':(0x16,0x02),'T':(0x17,0x02),'U':(0x18,0x02),'V':(0x19,0x02),'W':(0x1A,0x02),'X':(0x1B,0x02),'Y':(0x1C,0x02),'Z':(0x1D,0x02),
-'1':(0x1E,0),'2':(0x1F,0),'3':(0x20,0),'4':(0x21,0),'5':(0x22,0),'6':(0x23,0),'7':(0x24,0),'8':(0x25,0),'9':(0x26,0),'0':(0x27,0),
-'!':(0x1E,0x02),'@':(0x1F,0x02),'#':(0x20,0x02),'$':(0x21,0x02),'%':(0x22,0x02),'^':(0x23,0x02),'&':(0x24,0x02),'*':(0x25,0x02),'(':(0x26,0x02),')':(0x27,0x02),
-'-':(0x2D,0),'_':(0x2D,0x02),'=':(0x2E,0),'+':(0x2E,0x02),
-';':(0x33,0),':':(0x33,0x02),'\n':(0x28,0)
-}
+### ─────────────────────────────
+### udev rules (non-standard scanners)
+### ─────────────────────────────
+cat >/etc/udev/rules.d/99-production-scanner.rules <<'EOF'
+SUBSYSTEM=="input", ATTRS{idVendor}=="*", ATTRS{idProduct}=="*", MODE="0660", GROUP="plugdev"
 EOF
 
+udevadm control --reload
 
-# ---------- MAIN ----------
-cat > "$BASE/main.py" <<'EOF'
+### ─────────────────────────────
+### Python runtime
+### ─────────────────────────────
+cat >/opt/production_scanner.py <<EOF
 #!/usr/bin/env python3
-import os,time,evdev,select
-from hid_usage import CHAR_TO_HID
-SEG=int(os.getenv('SEGMENT','1'))
-HID=os.getenv('HID_OUT','/dev/hidg0')
-scanner=None
-for p in evdev.list_devices():
-d=evdev.InputDevice(p)
-if 'HID' in d.name.upper(): scanner=d
-assert scanner
-buf="";shift=False
-with open(HID,'wb',buffering=0) as hid:
-for e in scanner.read_loop():
-if e.type!=1: continue
-if e.code in (42,54): shift=e.value==1; continue
-if e.value!=1: continue
-if e.code==28:
-parts=buf.split(';')
-if len(parts)>SEG:
-for ch in parts[SEG]:
-if ch in CHAR_TO_HID:
-kc,mod=CHAR_TO_HID[ch]
-hid.write(bytes([mod,0,kc,0,0,0,0,0]));hid.write(b'\x00'*8)
+import evdev, os, time
+
+SEGMENT=$SEGMENT
+HID="/dev/hidg0"
+
+KEYMAP = {
+ 'a':0x04,'b':0x05,'c':0x06,'d':0x07,'e':0x08,'f':0x09,'g':0x0a,
+ 'h':0x0b,'i':0x0c,'j':0x0d,'k':0x0e,'l':0x0f,'m':0x10,
+ 'n':0x11,'o':0x12,'p':0x13,'q':0x14,'r':0x15,'s':0x16,
+ 't':0x17,'u':0x18,'v':0x19,'w':0x1a,'x':0x1b,'y':0x1c,'z':0x1d,
+ '1':0x1e,'2':0x1f,'3':0x20,'4':0x21,'5':0x22,'6':0x23,
+ '7':0x24,'8':0x25,'9':0x26,'0':0x27,
+ '-':0x2d,'=':0x2e,';':0x33,'/':0x38,
+ '\n':0x28
+}
+
+SHIFT = {
+ '!':(0x1e,0x02),'@':(0x1f,0x02),'#':(0x20,0x02),'$':(0x21,0x02),
+ '%':(0x22,0x02),'&':(0x24,0x02),'*':(0x25,0x02),
+ '(':(0x26,0x02),')':(0x27,0x02),
+ ':':(0x33,0x02),'+':(0x2e,0x02)
+}
+
+def send(s):
+ with open(HID,'wb', buffering=0) as h:
+  for c in s:
+   if c in SHIFT:
+    k,m=SHIFT[c]
+    h.write(bytes([m,0,k,0,0,0,0,0]))
+   else:
+    h.write(bytes([0,0,KEYMAP[c],0,0,0,0,0]))
+   h.write(b'\0'*8)
+  h.write(bytes([0,0,0x28,0,0,0,0,0]))
+  h.write(b'\0'*8)
+
+dev=next(evdev.list_devices())
+d=evdev.InputDevice(dev)
 buf=""
-else:
-buf+=chr(e.code)
+for e in d.read_loop():
+ if e.type==evdev.ecodes.EV_KEY and e.value==1:
+  if e.code==28:
+   part=buf.split(';')[SEGMENT]
+   send(part)
+   buf=""
+  else:
+   try: buf+=evdev.ecodes.KEY[e.code].lower().replace('key_','')
+   except: pass
 EOF
-chmod +x "$BASE/main.py"
 
+chmod +x /opt/production_scanner.py
 
-# ---------- SYSTEMD ----------
-cat > /etc/systemd/system/hid-gadget.service <<'EOF'
+### ─────────────────────────────
+### systemd
+### ─────────────────────────────
+cat >/etc/systemd/system/hid-gadget.service <<'EOF'
 [Unit]
 Description=USB HID Gadget
+Before=production-scanner.service
+
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/setup_hid.sh
 RemainAfterExit=yes
+
 [Install]
 WantedBy=multi-user.target
 EOF
 
-
-cat > /etc/systemd/system/production-scanner.service <<'EOF'
+cat >/etc/systemd/system/production-scanner.service <<'EOF'
 [Unit]
-Description=Production Scanner
+Description=Production QR Scanner
 After=hid-gadget.service
-Requires=hid-gadget.service
+
 [Service]
-EnvironmentFile=/etc/production-scanner/config.env
-ExecStart=/usr/bin/python3 /opt/production-scanner/main.py
+ExecStart=/usr/bin/python3 /opt/production_scanner.py
 Restart=always
 RestartSec=1
+
 [Install]
 WantedBy=multi-user.target
 EOF
-
 
 systemctl daemon-reload
 systemctl enable hid-gadget.service production-scanner.service
-systemctl start hid-gadget.service production-scanner.service
+systemctl restart hid-gadget.service production-scanner.service
 
-
-echo "INSTALL DONE"
+echo "[✓] INSTALL COMPLETE"
