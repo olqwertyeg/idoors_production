@@ -36,7 +36,7 @@ done
 
 ### CPU limit (idempotent)
 CURRENT_MAX=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 2>/dev/null || echo 0)
-if [ "$CURRENT_MAX" -gt "$MAX_FREQ" ]; then
+if [ "$CURRENT_MAX" -gt "$MAX_FREQ" ] 2>/dev/null; then
   echo "[+] Applying CPU limit to $((MAX_FREQ/1000)) MHz"
   if command -v cpupower >/dev/null; then
     cpupower frequency-set -g performance
@@ -51,7 +51,7 @@ else
   echo "[+] CPU limit already applied or lower (current: $((CURRENT_MAX/1000)) MHz)"
 fi
 
-# CPU service
+# CPU service (overwrite)
 cat > /etc/systemd/system/cpu-limit.service <<EOF
 [Unit]
 Description=Limit CPU frequency
@@ -88,18 +88,15 @@ if [ ! -f /etc/modprobe.d/g_serial.conf ]; then
   REBOOT_NEEDED=1
 fi
 
-### Logrotate for production_scanner.log (to prevent overflow)
+### Logrotate
 cat > /etc/logrotate.d/production_scanner <<'EOF'
-/var/log/production_scanner.log {
+/var/log/production_scanner.log /var/log/hid-gadget.log {
   daily
   rotate 7
   compress
   missingok
   notifempty
   create 0644 root root
-  postrotate
-    systemctl restart production-scanner.service > /dev/null 2>&1 || true
-  endscript
 }
 EOF
 
@@ -253,7 +250,7 @@ EOF
 sed -i "s/__SEGMENT__/$SEGMENT/" /opt/production_scanner.py
 chmod +x /opt/production_scanner.py
 
-### Systemd
+### Systemd services (fix ExecStartPre)
 cat > /etc/systemd/system/hid-gadget.service <<'EOF'
 [Unit]
 Description=USB HID Gadget
@@ -261,7 +258,7 @@ After=local-fs.target
 
 [Service]
 Type=oneshot
-ExecStartPre=/sbin/rmmod g_serial || true
+ExecStartPre=/bin/bash -c "/sbin/rmmod g_serial || true"
 ExecStart=/usr/local/bin/setup_hid.sh
 RemainAfterExit=yes
 WatchdogSec=60
