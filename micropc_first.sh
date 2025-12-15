@@ -11,7 +11,7 @@ LOG=/var/log/production-scanner-install.log
 exec > >(tee -a "$LOG") 2>&1
 echo "[+] Updating Production Scanner (segment=$SEGMENT)"
 
-if [[ $EUID -ne 0 ]]; then
+if [ "$EUID" -ne 0 ]; then
   echo "Run as sudo"
   exit 1
 fi
@@ -26,23 +26,17 @@ else
 fi
 echo "[+] Model: $MODEL, target CPU max: $((MAX_FREQ/1000)) MHz"
 
-### Пакеты (idempotent)
+### Пакеты
 apt-get update
-for pkg in python3 python3-evdev usbutils linux-cpupower device-tree-compiler; do
+for pkg in python3 python3-evdev usbutils linux-cpupower device-tree-compiler logrotate; do
   if ! dpkg -s "$pkg" >/dev/null 2>&1; then
     apt-get install -y "$pkg"
   fi
 done
 
-### CPU limit (только если нужно)
-CURRENT_MAX=0
-if command -v cpupower >/dev/null; then
-  CURRENT_MAX=$(cpupower frequency-info -l | awk '{print $2 * 1000}')
-else
-  CURRENT_MAX=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 2>/dev/null || echo 0)
-fi
-
-if (( CURRENT_MAX > MAX_FREQ )); then
+### CPU limit (idempotent)
+CURRENT_MAX=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 2>/dev/null || echo 0)
+if [ "$CURRENT_MAX" -gt "$MAX_FREQ" ]; then
   echo "[+] Applying CPU limit to $((MAX_FREQ/1000)) MHz"
   if command -v cpupower >/dev/null; then
     cpupower frequency-set -g performance
@@ -54,10 +48,10 @@ if (( CURRENT_MAX > MAX_FREQ )); then
     done
   fi
 else
-  echo "[+] CPU limit already applied (current max: $((CURRENT_MAX/1000)) MHz)"
+  echo "[+] CPU limit already applied or lower (current: $((CURRENT_MAX/1000)) MHz)"
 fi
 
-# CPU service (overwrite if changed)
+# CPU service
 cat > /etc/systemd/system/cpu-limit.service <<EOF
 [Unit]
 Description=Limit CPU frequency
@@ -72,14 +66,11 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-if ! systemctl is-enabled cpu-limit.service >/dev/null 2>&1; then
-  systemctl enable cpu-limit.service
-fi
-systemctl restart cpu-limit.service
+systemctl enable --now cpu-limit.service
 
-### Overlays (только если нужно)
+### Overlays
 REBOOT_NEEDED=0
-if [[ -f /boot/armbianEnv.txt ]]; then
+if [ -f /boot/armbianEnv.txt ]; then
   if ! grep -q "usb0-device" /boot/armbianEnv.txt; then
     if grep -q "^overlays=" /boot/armbianEnv.txt; then
       sed -i 's/\(overlays=.*\)/\1 usb0-device/' /boot/armbianEnv.txt
@@ -92,13 +83,27 @@ fi
 modprobe libcomposite configfs 2>/dev/null || true
 
 ### Blacklist g_serial
-BLACKLIST_FILE="/etc/modprobe.d/g_serial.conf"
-if [[ ! -f "$BLACKLIST_FILE" ]]; then
-  echo "blacklist g_serial" > "$BLACKLIST_FILE"
+if [ ! -f /etc/modprobe.d/g_serial.conf ]; then
+  echo "blacklist g_serial" > /etc/modprobe.d/g_serial.conf
   REBOOT_NEEDED=1
 fi
 
-### HID setup script (overwrite)
+### Logrotate for production_scanner.log (to prevent overflow)
+cat > /etc/logrotate.d/production_scanner <<'EOF'
+/var/log/production_scanner.log {
+  daily
+  rotate 7
+  compress
+  missingok
+  notifempty
+  create 0644 root root
+  postrotate
+    systemctl restart production-scanner.service > /dev/null 2>&1 || true
+  endscript
+}
+EOF
+
+### HID setup script
 cat > /usr/local/bin/setup_hid.sh <<'EOF'
 #!/bin/bash
 set -u
@@ -122,7 +127,7 @@ for i in {1..30}; do
   sleep 0.2
 done
 if [ -z "$UDC" ]; then
-  echo "ERROR: no UDC found" >>"$LOG"
+  echo "ERROR: no UDC" >>"$LOG"
   exit 0
 fi
 
@@ -155,18 +160,18 @@ for i in {1..10}; do
   echo "$UDC" > UDC 2>>"$LOG" && { echo "bound $UDC" >>"$LOG"; exit 0; }
   sleep 0.3
 done
-echo "WARN: failed to bind UDC" >>"$LOG"
+echo "WARN: failed to bind" >>"$LOG"
 exit 0
 EOF
 chmod +x /usr/local/bin/setup_hid.sh
 
-### Udev rules
+### Udev
 cat > /etc/udev/rules.d/99-production-scanner.rules <<'EOF'
 SUBSYSTEM=="input", KERNEL=="event*", MODE="0660", GROUP="plugdev"
 EOF
 udevadm control --reload 2>/dev/null || true
 
-### Python script (overwrite)
+### Python script
 cat > /opt/production_scanner.py <<'EOF'
 #!/usr/bin/env python3
 import evdev
@@ -248,7 +253,7 @@ EOF
 sed -i "s/__SEGMENT__/$SEGMENT/" /opt/production_scanner.py
 chmod +x /opt/production_scanner.py
 
-### Systemd services
+### Systemd
 cat > /etc/systemd/system/hid-gadget.service <<'EOF'
 [Unit]
 Description=USB HID Gadget
@@ -284,7 +289,7 @@ systemctl daemon-reload
 systemctl enable hid-gadget.service production-scanner.service
 systemctl restart hid-gadget.service production-scanner.service
 
-echo "[✓] INSTALL/UPDATE COMPLETE"
-if [[ $REBOOT_NEEDED -eq 1 ]]; then
-  echo "[!] REBOOT recommended for overlays and blacklist"
+echo "[✓] UPDATE COMPLETE"
+if [ "$REBOOT_NEEDED" -eq 1 ]; then
+  echo "[!] REBOOT recommended"
 fi
