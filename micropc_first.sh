@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SEGMENT="${1:-1}"
-if ! [[ "$SEGMENT" =~ ^[0-2]$ ]]; then
+if ! [[ "$SEGMENT" =~ ^[1-3]$ ]]; then
   echo "SEGMENT must be 0, 1 or 2"
   exit 1
 fi
@@ -304,7 +304,7 @@ for event in dev.read_loop():
                     parts = buf.split(';')
                     log(f"Parts after split: {parts}")
                     if SEGMENT < len(parts):
-                        segment = parts[SEGMENT].strip()
+                        segment = parts[SEGMENT-1].strip()
                         log(f"Transmitting segment {SEGMENT}: '{segment}'")
                         send(segment)
                     buf = ""
