@@ -287,7 +287,7 @@ EOF
 create_main_script() {
     log "Создание главного скрипта..."
     
-    cat > /opt/production_scanner.py << EOF
+    cat > /opt/production_scanner.py << 'SCRIPT_EOF'
 #!/usr/bin/env python3
 """
 🏭 PRODUCTION SCANNER для Orange Pi Zero H3
@@ -303,11 +303,10 @@ from datetime import datetime
 
 # ================= КОНФИГУРАЦИЯ =================
 HID_DEVICE = "/dev/hidg0"
-SEGMENT_NUMBER = $SEGMENT
+SEGMENT_NUMBER = __SEGMENT_NUMBER__
 LOG_FILE = "/var/log/scanner.log"
 
 # ================= КАРТА КЛАВИШ =================
-HID_KEYMAP = {
 HID_KEYMAP = {
     # Цифры
     '0': 0x27, '1': 0x1E, '2': 0x1F, '3': 0x20, '4': 0x21,
@@ -327,9 +326,9 @@ HID_KEYMAP = {
     '=': 0x2E,          # Equal
     '[': 0x2F,          # Left bracket
     ']': 0x30,          # Right bracket
-    '\\\\': 0x31,       # Backslash - 
+    '\\': 0x31,         # Backslash
     ';': 0x33,          # Semicolon
-    "'": 0x34,          # Quote - одинарная кавычка ВНУТРИ двойных
+    "'": 0x34,          # Quote
     '`': 0x35,          # Grave
     ',': 0x36,          # Comma
     '.': 0x37,          # Period
@@ -340,7 +339,7 @@ HID_KEYMAP = {
     '+': (0x2E, 0x02),   # Shift + =
     '{': (0x2F, 0x02),   # Shift + [
     '}': (0x30, 0x02),   # Shift + ]
-    '|': (0x31, 0x02),   # Shift + \\
+    '|': (0x31, 0x02),   # Shift + \
     ':': (0x33, 0x02),   # Shift + ;
     '"': (0x34, 0x02),   # Shift + '
     '~': (0x35, 0x02),   # Shift + `
@@ -375,7 +374,7 @@ def log(message, level="INFO"):
     
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(log_line + "\\n")
+            f.write(log_line + "\n")
     except Exception:
         pass
 
@@ -421,7 +420,7 @@ class HIDKeyboard:
                 log(f"⚠️  Неподдерживаемый символ: '{char}'", "WARNING")
         
         # Enter в конце
-        self.send_key(HID_KEYMAP['\\n'])
+        self.send_key(HID_KEYMAP['\n'])
         log("↵ Enter отправлен")
         return True
 
@@ -528,7 +527,7 @@ def main():
     
     log("🚀 Система готова")
     log("📋 Формат QR: XXX;YYY;ZZZ")
-    print("\\n" + "=" * 70)
+    print("\n" + "=" * 70)
     
     cycle = 0
     
@@ -555,7 +554,7 @@ def main():
             log(f"✅ Отправлено: '{value}'")
             
             time.sleep(0.1)
-            print("\\n" + "-" * 50)
+            print("\n" + "-" * 50)
             
         except KeyboardInterrupt:
             log("🛑 Остановлено", "INFO")
@@ -572,7 +571,10 @@ if __name__ == "__main__":
     
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
     main()
-EOF
+SCRIPT_EOF
+
+    # Заменяем placeholder на реальный номер сегмента
+    sed -i "s/__SEGMENT_NUMBER__/$SEGMENT/" /opt/production_scanner.py
     
     chmod +x /opt/production_scanner.py
     success "Главный скрипт создан"
