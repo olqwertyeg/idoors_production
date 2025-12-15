@@ -308,6 +308,7 @@ LOG_FILE = "/var/log/scanner.log"
 
 # ================= КАРТА КЛАВИШ =================
 HID_KEYMAP = {
+HID_KEYMAP = {
     # Цифры
     '0': 0x27, '1': 0x1E, '2': 0x1F, '3': 0x20, '4': 0x21,
     '5': 0x22, '6': 0x23, '7': 0x24, '8': 0x25, '9': 0x26,
@@ -326,9 +327,9 @@ HID_KEYMAP = {
     '=': 0x2E,          # Equal
     '[': 0x2F,          # Left bracket
     ']': 0x30,          # Right bracket
-    '\\\\': 0x31,       # Backslash
+    '\\\\': 0x31,       # Backslash - 
     ';': 0x33,          # Semicolon
-    "'": 0x34,          # Quote
+    "'": 0x34,          # Quote - одинарная кавычка ВНУТРИ двойных
     '`': 0x35,          # Grave
     ',': 0x36,          # Comma
     '.': 0x37,          # Period
@@ -351,7 +352,7 @@ HID_KEYMAP = {
     '!': (0x1E, 0x02),   # Shift + 1
     '@': (0x1F, 0x02),   # Shift + 2
     '#': (0x20, 0x02),   # Shift + 3
-    '\$': (0x21, 0x02),  # Shift + 4
+    '$': (0x21, 0x02),   # Shift + 4
     '%': (0x22, 0x02),   # Shift + 5
     '^': (0x23, 0x02),   # Shift + 6
     '&': (0x24, 0x02),   # Shift + 7
@@ -360,9 +361,9 @@ HID_KEYMAP = {
     ')': (0x27, 0x02),   # Shift + 0
     
     # Управляющие клавиши
-    '\\n': 0x28,  # Enter
-    '\\t': 0x2B,  # Tab
-    '\\b': 0x2A,  # Backspace
+    '\n': 0x28,  # Enter
+    '\t': 0x2B,  # Tab
+    '\b': 0x2A,  # Backspace
 }
 
 # ================= ЛОГГИНГ =================
