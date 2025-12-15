@@ -14,18 +14,14 @@ fi
 
 # Определение модели платы
 MODEL=$(cat /proc/device-tree/model 2>/dev/null || echo "Unknown")
-if [[ "$MODEL" == *"Orange Pi Zero"* && "$MODEL" == *"H3"* ]]; then
-  MODEL="H3"
-  MAX_FREQ=800000  # 800 MHz
-  UDC_MOD="sunxi_udc"
-elif [[ "$MODEL" == *"Orange Pi Zero 2W"* ]]; then
+if [[ "$MODEL" == *"Orange Pi Zero 2W"* ]]; then
   MODEL="Zero2W"
   MAX_FREQ=1000000  # 1000 MHz
   UDC_MOD="dwc2"
 else
-  echo "[!] Unknown model: $MODEL. Assuming H3."
+  # Handle Xunlong Orange Pi Zero as H3-compatible (H2+ SoC)
   MODEL="H3"
-  MAX_FREQ=800000
+  MAX_FREQ=800000  # 800 MHz
   UDC_MOD="sunxi_udc"
 fi
 echo "[+] Detected model: $MODEL, max CPU freq: $((MAX_FREQ/1000)) MHz"
@@ -34,20 +30,23 @@ echo "[+] Detected model: $MODEL, max CPU freq: $((MAX_FREQ/1000)) MHz"
 ### Packages (idempotent)
 ### ─────────────────────────────
 apt-get update
-for pkg in python3 python3-evdev usbutils systemd udev cpufrequtils; do
+for pkg in python3 python3-evdev usbutils systemd udev linux-cpupower; do
   dpkg -s "$pkg" >/dev/null 2>&1 || apt-get install -y "$pkg"
 done
 
 ### ─────────────────────────────
 ### CPU limit (disable overclock, set max freq)
 ### ─────────────────────────────
-if ! command -v cpufreq-set >/dev/null; then
-  echo "[!] cpufrequtils not installed"; exit 1;
+if ! command -v cpupower >/dev/null; then
+  echo "[!] cpupower not available - falling back to sysfs"; 
+  for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
+    echo "performance" > "$cpu/cpufreq/scaling_governor" 2>/dev/null || true
+    echo "$MAX_FREQ" > "$cpu/cpufreq/scaling_max_freq" 2>/dev/null || true
+  done
+else
+  cpupower frequency-set -g performance
+  cpupower frequency-set --max $((MAX_FREQ / 1000))MHz
 fi
-cpufreq-set -g performance  # Фиксированный governor для стабильности
-for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
-  echo "$MAX_FREQ" > "$cpu/cpufreq/scaling_max_freq" 2>/dev/null || true
-done
 echo "[+] CPU limited to $((MAX_FREQ/1000)) MHz"
 
 # Автозагрузка CPU settings (idempotent)
@@ -60,12 +59,13 @@ After=multi-user.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'cpufreq-set -g performance; for cpu in /sys/devices/system/cpu/cpu[0-9]*; do echo MAX_FREQ > $cpu/cpufreq/scaling_max_freq; done'
+ExecStart=/bin/bash -c 'if command -v cpupower >/dev/null; then cpupower frequency-set -g performance; cpupower frequency-set --max MAX_FREQ_MHZMHz; else for cpu in /sys/devices/system/cpu/cpu[0-9]*; do echo "performance" > $cpu/cpufreq/scaling_governor; echo MAX_FREQ > $cpu/cpufreq/scaling_max_freq; done; fi'
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
+  sed -i "s/MAX_FREQ_MHZ/$((MAX_FREQ / 1000))/" "$CPU_SERVICE"
   sed -i "s/MAX_FREQ/$MAX_FREQ/" "$CPU_SERVICE"
   systemctl daemon-reload
   systemctl enable cpu-limit.service
@@ -85,6 +85,8 @@ if [[ -f /boot/armbianEnv.txt ]]; then  # Armbian (H3)
 else  # Debian Trixie (Zero2W)
   DTB=$(find /boot/dtbs -name "*orangepi-zero2*" 2>/dev/null | head -n1)
   if [[ -n "$DTB" && ! fdtdump "$DTB" 2>/dev/null | grep -q 'dr_mode = "otg"' ]]; then
+    # Install device-tree-compiler if needed
+    dpkg -s device-tree-compiler >/dev/null 2>&1 || apt-get install -y device-tree-compiler
     fdtdump "$DTB" > dt.dts
     sed -i 's/dr_mode = "host"/dr_mode = "otg"/' dt.dts
     dtc -I dts -O dtb dt.dts > "$DTB"
@@ -139,7 +141,7 @@ mkdir -p functions/hid.usb0
 echo 0 > functions/hid.usb0/protocol  # Generic HID
 echo 0 > functions/hid.usb0/subclass  # No boot
 echo 64 > functions/hid.usb0/report_length  # Bulk-like
-echo -ne '...\x05\x01\x09\x06\xa1\x01\x05\x07\x19\xe0\x29\xe7\x15\x00\x25\x01\x75\x01\x95\x08\x81\x02\x95\x01\x75\x08\x81\x03\x95\x05\x75\x01\x05\x08\x19\x01\x29\x05\x91\x02\x95\x01\x75\x03\x91\x03\x95\x06\x75\x08\x15\x00\x25\x65\x05\x07\x19\x00\x29\x65\x81\x00\xc0' > functions/hid.usb0/report_desc
+echo -ne '\x05\x01\x09\x06\xa1\x01\x05\x07\x19\xe0\x29\xe7\x15\x00\x25\x01\x75\x01\x95\x08\x81\x02\x95\x01\x75\x08\x81\x03\x95\x05\x75\x01\x05\x08\x19\x01\x29\x05\x91\x02\x95\x01\x75\x03\x91\x03\x95\x06\x75\x08\x15\x00\x25\x65\x05\x07\x19\x00\x29\x65\x81\x00\xc0' > functions/hid.usb0/report_desc
 ln -sf functions/hid.usb0 configs/c.1/
 
 # Bind with retries + hot-rebind
@@ -185,7 +187,7 @@ KEYMAP = {  # Базовый (no shift)
 SHIFT_MAP = {  # С shift
  '!':(0x1e,0x02),'@':(0x1f,0x02),'#':(0x20,0x02),'$':(0x21,0x02),
  '%':(0x22,0x02),'^':(0x23,0x02),'&':(0x24,0x02),'*':(0x25,0x02),
- '(':0x26,')':0x27,  # Без shift для ()
+ '(': (0x26,0x02), ')': (0x27,0x02),
  '+':(0x2e,0x02),':':(0x33,0x02),'"':(0x34,0x02)
 }
 def send(s):  # Bulk write: собираем report в буфер
@@ -216,7 +218,8 @@ for e in dev.read_loop():
   if e.value==1:
    try:
     key = evdev.ecodes.KEY[e.code].replace('KEY_','').lower()
-    if shift: key = key.upper() if key.isalpha() else SHIFT_MAP.get(key.upper(), (0,0))[0]
+    if shift and key.isalpha(): key = key.upper()
+    elif shift: key = SHIFT_MAP.get(key, ('',0))[0]
     if key == 'enter':
      part=buf.split(';')[SEGMENT]
      send(part)
