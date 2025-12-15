@@ -1,1001 +1,951 @@
 #!/bin/bash
-# ================================================
-# 🏭 ПОЛНАЯ УСТАНОВКА АВТОМАТИЗАЦИИ ПРОИЗВОДСТВА
-# Orange Pi Zero H3 - QR сканер → HID клавиатура
-# ================================================
-# Запуск: sudo ./install_scanner.sh
-# ================================================
+# production-scanner-setup.sh
+# Универсальный скрипт установки для Orange Pi Zero H3 / Pi Zero 2W
+# Запуск: sudo bash production-scanner-setup.sh <номер_сегмента>
 
-set -e  # Останавливаться при ошибках
+set -e  # Прерывать при ошибках
+
+# ================= КОНФИГУРАЦИЯ =================
+SEGMENT_NUMBER="${1:-1}"  # По умолчанию второй сегмент
+LOG_FILE="/var/log/scanner-install.log"
+REPO_URL="https://github.com/olqwertyeg/idoors_production.git"
 
 # Цвета для вывода
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-print_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+# ================= ФУНКЦИИ ЛОГГИНГА =================
+log() {
+    echo -e "${BLUE}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $1" | tee -a "$LOG_FILE"
 }
 
-print_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+success() {
+    echo -e "${GREEN}✅ $1${NC}" | tee -a "$LOG_FILE"
 }
 
-print_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+warning() {
+    echo -e "${YELLOW}⚠️  $1${NC}" | tee -a "$LOG_FILE"
 }
 
-# ================= ПРОВЕРКА ПРАВ =================
-if [[ $EUID -ne 0 ]]; then
-   print_error "Запускай с sudo!"
-   print_error "  sudo $0"
-   exit 1
-fi
+error() {
+    echo -e "${RED}❌ $1${NC}" | tee -a "$LOG_FILE"
+}
 
-print_info "========================================"
-print_info "🏭 УСТАНОВКА АВТОМАТИЗАЦИИ ПРОИЗВОДСТВА"
-print_info "Orange Pi Zero H3 - QR → HID клавиатура"
-print_info "========================================"
-
-# ================= 1. ОБНОВЛЕНИЕ СИСТЕМЫ =================
-print_info "1. Обновление системы..."
-apt update -y
-apt upgrade -y
-
-# ================= 2. УСТАНОВКА ПАКЕТОВ =================
-print_info "2. Установка необходимых пакетов..."
-apt install -y \
-    python3 \
-    python3-pip \
-    python3-serial \
-    git \
-    vim \
-    screen \
-    htop \
-    usbutils \
-    xxd \
-    curl \
-    wget
-
-# Python библиотеки
-print_info "3. Установка Python библиотек..."
-pip3 install evdev
-
-# ================= 4. ФУНКЦИЯ ДЛЯ АВТООПРЕДЕЛЕНИЯ UDC =================
-print_info "4. Создание функции определения UDC..."
-
-cat > /usr/local/bin/find_udc.sh << 'EOF'
-#!/bin/bash
-# Автоматическое определение правильного UDC контроллера
-
-echo "🔍 Поиск UDC контроллера..."
-
-# Проверяем доступные UDC контроллеры
-if [ -d /sys/class/udc ]; then
-    UDC_LIST=$(ls /sys/class/udc/ 2>/dev/null)
+# ================= ПРОВЕРКА ПРАВ И АРГУМЕНТОВ =================
+check_prerequisites() {
+    log "Проверка предварительных условий..."
     
-    if [ -n "$UDC_LIST" ]; then
-        echo "✅ Найдены UDC контроллеры:"
-        for udc in $UDC_LIST; do
-            echo "   - $udc"
-        done
+    # Проверка прав
+    if [[ $EUID -ne 0 ]]; then
+        error "Запускай с sudo, брат!"
+        exit 1
+    fi
+    
+    # Проверка аргумента
+    if ! [[ "$SEGMENT_NUMBER" =~ ^[0-2]$ ]]; then
+        error "Номер сегмента должен быть 0, 1 или 2"
+        echo "Использование: sudo bash $0 <номер_сегмента>"
+        echo "  где <номер_сегмента>:"
+        echo "    0 - первый сегмент (123;456;789 -> 123)"
+        echo "    1 - второй сегмент (123;456;789 -> 456)"
+        echo "    2 - третий сегмент (123;456;789 -> 789)"
+        exit 1
+    fi
+    
+    success "Проверка пройдена. Используется сегмент: $SEGMENT_NUMBER"
+}
+
+# ================= ОПРЕДЕЛЕНИЕ ПЛАТЫ =================
+detect_board() {
+    log "Определение типа платы..."
+    
+    # Проверяем разные методы определения платы
+    if [[ -f /proc/device-tree/model ]]; then
+        BOARD_MODEL=$(tr -d '\0' < /proc/device-tree/model)
+        log "Модель из device-tree: $BOARD_MODEL"
+    fi
+    
+    # Проверяем по /proc/cpuinfo
+    if grep -q "Raspberry Pi" /proc/cpuinfo 2>/dev/null || [[ "$BOARD_MODEL" == *"Raspberry"* ]]; then
+        BOARD_TYPE="raspberry"
+        if [[ "$BOARD_MODEL" == *"Zero 2"* ]] || [[ "$BOARD_MODEL" == *"Zero2"* ]]; then
+            BOARD="pi_zero_2w"
+        elif [[ "$BOARD_MODEL" == *"Zero"* ]]; then
+            BOARD="pi_zero"
+        else
+            BOARD="raspberry"
+        fi
+    elif [[ "$BOARD_MODEL" == *"Orange Pi Zero"* ]] || grep -q "sun8i" /proc/cpuinfo 2>/dev/null; then
+        BOARD_TYPE="orange"
+        BOARD="orange_pi_zero_h3"
+    else
+        warning "Неизвестная плата, использую универсальные настройки"
+        BOARD_TYPE="generic"
+        BOARD="unknown"
+    fi
+    
+    success "Определена плата: $BOARD ($BOARD_MODEL)"
+    echo "$BOARD_TYPE" > /tmp/board_type.txt
+    echo "$BOARD" > /tmp/board_name.txt
+}
+
+# ================= УСТАНОВКА ПАКЕТОВ =================
+install_packages() {
+    log "Установка необходимых пакетов..."
+    
+    # Обновление списка пакетов
+    apt-get update 2>&1 | tee -a "$LOG_FILE"
+    
+    # Базовые пакеты
+    local base_packages=(
+        python3
+        python3-pip
+        python3-venv
+        python3-serial
+        git
+        vim
+        xxd
+        usbutils
+    )
+    
+    # Установка с проверкой
+    for pkg in "${base_packages[@]}"; do
+        if dpkg -l | grep -q "^ii  $pkg "; then
+            log "Пакет $pkg уже установлен"
+        else
+            log "Установка $pkg..."
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" 2>&1 | tee -a "$LOG_FILE"
+        fi
+    done
+    
+    # Установка evdev с учетом новых ограничений Debian 12+
+    log "Установка Python библиотек..."
+    if python3 -c "import evdev" 2>/dev/null; then
+        log "evdev уже установлен"
+    else
+        # Пробуем установить через apt
+        if apt-cache show python3-evdev >/dev/null 2>&1; then
+            apt-get install -y python3-evdev 2>&1 | tee -a "$LOG_FILE"
+        else
+            # Устанавливаем через pip с --break-system-packages
+            warning "Установка evdev через pip с флагом --break-system-packages"
+            python3 -m pip install evdev --break-system-packages 2>&1 | tee -a "$LOG_FILE"
+        fi
+    fi
+    
+    success "Пакеты установлены"
+}
+
+# ================= НАСТРОЙКА USB GADGET =================
+setup_usb_gadget() {
+    log "Настройка USB Gadget режима..."
+    
+    local board_type=$(cat /tmp/board_type.txt 2>/dev/null || echo "generic")
+    
+    case $board_type in
+        "raspberry")
+            setup_raspberry_usb
+            ;;
+        "orange")
+            setup_orange_pi_usb
+            ;;
+        *)
+            warning "Неизвестная плата, настраиваю универсальный режим"
+            setup_generic_usb
+            ;;
+    esac
+}
+
+setup_raspberry_usb() {
+    log "Настройка USB для Raspberry Pi..."
+    
+    # Проверяем и добавляем dtoverlay
+    local config_file="/boot/firmware/config.txt"
+    if [[ ! -f "$config_file" ]]; then
+        config_file="/boot/config.txt"
+    fi
+    
+    if grep -q "dtoverlay=dwc2" "$config_file" 2>/dev/null; then
+        log "dtoverlay=dwc2 уже настроен"
+    else
+        log "Добавляю dtoverlay=dwc2 в $config_file"
+        echo -e "\n# Production Scanner USB Gadget\ndtoverlay=dwc2" >> "$config_file"
+        warning "Требуется перезагрузка для применения настроек USB"
+    fi
+    
+    # Настройка cmdline.txt
+    local cmdline_file="/boot/firmware/cmdline.txt"
+    if [[ ! -f "$cmdline_file" ]]; then
+        cmdline_file="/boot/cmdline.txt"
+    fi
+    
+    if grep -q "modules-load=dwc2,g_hid" "$cmdline_file" 2>/dev/null; then
+        log "Модули уже добавлены в cmdline.txt"
+    else
+        log "Добавляю модули в cmdline.txt"
         
-        # Берем первый попавшийся (обычно правильный)
-        SELECTED_UDC=$(echo "$UDC_LIST" | head -1)
-        echo "📱 Выбран UDC: $SELECTED_UDC"
-        echo "$SELECTED_UDC"
-        exit 0
+        # Читаем файл
+        local cmdline_content=$(cat "$cmdline_file")
+        
+        # Убираем возможные старые настройки
+        cmdline_content=$(echo "$cmdline_content" | sed 's/modules-load=[^ ]*//g')
+        
+        # Добавляем наши модули
+        if [[ "$cmdline_content" == *\" ]]; then
+            # Если заканчивается кавычкой
+            cmdline_content="${cmdline_content%?} modules-load=dwc2,g_hid\""
+        else
+            cmdline_content="$cmdline_content modules-load=dwc2,g_hid"
+        fi
+        
+        # Записываем обратно
+        echo "$cmdline_content" > "$cmdline_file"
+        warning "Требуется перезагрузка для загрузки модулей"
     fi
-fi
+    
+    success "Настройки Raspberry Pi применены"
+}
 
-# Если не нашли в /sys/class/udc, пробуем другие варианты
-echo "⚠️  UDC не найден в /sys/class/udc, ищу альтернативные пути..."
+setup_orange_pi_usb() {
+    log "Настройка USB для Orange Pi..."
+    
+    # Для Orange Pi обычно не нужно редактировать конфиги
+    # Просто загружаем модули
+    
+    # Создаем файл для автозагрузки модулей
+    local modules_file="/etc/modules-load.d/scanner.conf"
+    cat > "$modules_file" << EOF
+# Загрузка модулей для USB Gadget
+sunxi_udc
+libcomposite
+EOF
+    
+    log "Создан конфиг для автозагрузки модулей: $modules_file"
+    success "Настройки Orange Pi применены"
+}
 
-# Варианты для Orange Pi Zero H3
-POSSIBLE_UDCS=(
-    "musb-hdrc.4.auto"  # Твой случай
-    "musb-hdrc.1.auto"  # Частый случай
-    "musb-hdrc"         # Без номера
-    "20980000.usb"      # Для некоторых плат
-    "fe800000.usb"      # Для некоторых плат
-)
-
-# Проверяем sysfs на наличие контроллеров
-for udc in "${POSSIBLE_UDCS[@]}"; do
-    if [ -d "/sys/class/udc/$udc" ] || dmesg | grep -q "$udc"; then
-        echo "✅ Найден возможный UDC в sysfs/dmesg: $udc"
-        echo "$udc"
-        exit 0
+setup_generic_usb() {
+    log "Универсальная настройка USB..."
+    
+    # Пробуем определить доступные модули
+    if modprobe -n dwc2 2>/dev/null; then
+        setup_raspberry_usb
+    elif modprobe -n sunxi_udc 2>/dev/null; then
+        setup_orange_pi_usb
+    else
+        warning "Не удалось определить USB контроллер"
+        log "Будет использован configfs напрямую"
     fi
-done
+}
 
-# Последний вариант - ищем в dmesg
-echo "🔍 Поиск в dmesg..."
-DMESG_UDC=$(dmesg | grep -i "udc\|musb\|dwc" | grep -oE "musb-hdrc[^ ]*" | head -1)
+# ================= СОЗДАНИЕ СКРИПТА HID ГАДЖЕТА =================
+create_hid_script() {
+    log "Создание скрипта настройки HID..."
+    
+    local hid_script="/usr/local/bin/setup_hid_gadget.sh"
+    
+    cat > "$hid_script" << 'EOF'
+#!/bin/bash
+# Автоматическая настройка HID гаджета для Production Scanner
+# Поддерживает разные UDC контроллеры
 
-if [ -n "$DMESG_UDC" ]; then
-    echo "✅ Найден UDC в dmesg: $DMESG_UDC"
-    echo "$DMESG_UDC"
+set -e
+
+LOG_FILE="/var/log/hid-setup.log"
+HID_DEVICE="/dev/hidg0"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+# Проверяем, не создан ли уже гаджет
+if [[ -e "$HID_DEVICE" ]]; then
+    log "HID устройство уже существует"
     exit 0
 fi
 
-# Если ничего не нашли
-echo "❌ UDC контроллер не найден!"
-echo "ℹ️  Возможные причины:"
-echo "   1. Драйвер USB gadget не загружен"
-echo "   2. Плата не поддерживает USB gadget режим"
-echo "   3. Нужно перезагрузиться"
-exit 1
-EOF
+log "Начало настройки HID гаджета..."
 
-chmod +x /usr/local/bin/find_udc.sh
-
-# ================= 5. СОЗДАНИЕ СКРИПТА HID ГАДЖЕТА =================
-print_info "5. Создание скрипта HID гаджета..."
-
-cat > /usr/local/bin/setup_hid.sh << 'EOF'
-#!/bin/bash
-# Настройка HID клавиатуры для Orange Pi Zero H3
-# Автоматически создает /dev/hidg0
-
-echo "🔧 Настройка HID клавиатуры..."
-
-# Загружаем модули
-modprobe sunxi_udc 2>/dev/null
-modprobe usb_f_hid 2>/dev/null
-modprobe g_hid 2>/dev/null
+# Загружаем необходимые модули
+modprobe libcomposite 2>/dev/null || true
 
 # Монтируем configfs если не смонтирован
-mount -t configfs none /sys/kernel/config 2>/dev/null
+if ! mountpoint -q /sys/kernel/config; then
+    mount -t configfs none /sys/kernel/config 2>/dev/null || true
+fi
+
+# Ждем стабилизации
+sleep 1
 
 # Переходим в директорию гаджетов
 cd /sys/kernel/config/usb_gadget/ 2>/dev/null || {
-    echo "❌ Не могу перейти в configfs"
+    log "Ошибка: нет доступа к /sys/kernel/config/usb_gadget/"
     exit 1
 }
 
-# Удаляем старый если есть
-rm -rf g1 2>/dev/null
+# Удаляем старые гаджеты с таким же именем
+rm -rf production_scanner 2>/dev/null || true
 
 # Создаем новый гаджет
-mkdir g1
-cd g1
+mkdir -p production_scanner
+cd production_scanner
 
-# Базовые настройки
+# Устанавливаем VID/PID (можно менять)
 echo 0x1d6b > idVendor   # Linux Foundation
 echo 0x0104 > idProduct  # Composite Gadget
 
 # Информация об устройстве
-mkdir strings/0x409
-echo "Orange Pi Zero" > strings/0x409/manufacturer
-echo "Production Scanner" > strings/0x409/product
+mkdir -p strings/0x409
+echo "Production Scanner" > strings/0x409/manufacturer
+echo "Virtual Keyboard" > strings/0x409/product
 echo "001" > strings/0x409/serialnumber
 
 # Конфигурация
-mkdir configs/c.1
-mkdir configs/c.1/strings/0x409
-echo "HID Config" > configs/c.1/strings/0x409/configuration
+mkdir -p configs/c.1/strings/0x409
+echo "HID Keyboard Config" > configs/c.1/strings/0x409/configuration
 
-# Создаем HID функцию (клавиатура)
-mkdir functions/hid.usb0
+# HID функция
+mkdir -p functions/hid.usb0
 echo 1 > functions/hid.usb0/protocol    # Keyboard
 echo 1 > functions/hid.usb0/subclass    # Boot interface
 echo 8 > functions/hid.usb0/report_length
 
-# Дескриптор клавиатуры HID (стандартный)
-echo -ne \\x05\\x01\\x09\\x06\\xA1\\x01\\x05\\x07\\x19\\xE0\\x29\\xE7\\x15\\x00\\x25\\x01\\x75\\x01\\x95\\x08\\x81\\x02\\x95\\x01\\x75\\x08\\x81\\x03\\x95\\x05\\x75\\x01\\x05\\x08\\x19\\x01\\x29\\x05\\x91\\x02\\x95\\x01\\x75\\x03\\x91\\x03\\x95\\x06\\x75\\x08\\x15\\x00\\x25\\x65\\x05\\x07\\x19\\x00\\x29\\x65\\x81\\x00\\xC0 > functions/hid.usb0/report_desc
+# Дескриптор клавиатуры HID с поддержкой расширенного набора символов
+cat > /tmp/hid-descriptor.hex << 'DESC_EOF'
+05010906A101050719E029E715002501750195088102950175088103950575010508
+19012905910295017503910395067508150025650507190029658100050919012915
+00250175019508810295017508810395067501050819012905910295017503910395
+067508150025650507190029658100C0050C0901A1018501050C15002501095E7501
+951509017501951009027501950181028501050C0901A1018502050C15002501095E
+750195150901750195100902750195018102C0
+DESC_EOF
+
+# Конвертируем hex в binary
+xxd -r -p /tmp/hid-descriptor.hex > functions/hid.usb0/report_desc
+rm -f /tmp/hid-descriptor.hex
 
 # Связываем функцию с конфигурацией
-ln -s functions/hid.usb0 configs/c.1/
+ln -sf functions/hid.usb0 configs/c.1/
 
-# ========== АВТООПРЕДЕЛЕНИЕ И АКТИВАЦИЯ UDC ==========
-echo "🔍 Определение UDC контроллера..."
-
-# Используем нашу функцию поиска
-UDC_CONTROLLER=$(/usr/local/bin/find_udc.sh)
-
-if [ $? -eq 0 ] && [ -n "$UDC_CONTROLLER" ]; then
-    echo "✅ Найден UDC: $UDC_CONTROLLER"
-    echo "🚀 Активация гаджета..."
-    
-    # Пробуем активировать
-    if echo "$UDC_CONTROLLER" > UDC 2>/dev/null; then
-        echo "✅ Гаджет активирован с UDC: $UDC_CONTROLLER"
-    else
-        echo "⚠️  Не удалось активировать с $UDC_CONTROLLER, пробую другие варианты..."
+# Находим доступный UDC контроллер
+UDC_FOUND=""
+for udc in /sys/class/udc/*; do
+    if [[ -e "$udc" ]]; then
+        UDC_NAME=$(basename "$udc")
+        log "Найден UDC: $UDC_NAME"
         
-        # Пробуем варианты по порядку
-        for udc_try in "musb-hdrc.4.auto" "musb-hdrc.1.auto" "musb-hdrc" "musb-hdrc.0.auto"; do
-            if echo "$udc_try" > UDC 2>/dev/null; then
-                echo "✅ Гаджет активирован с UDC: $udc_try"
-                UDC_CONTROLLER="$udc_try"
-                break
-            fi
-        done
+        # Пробуем активировать
+        if echo "$UDC_NAME" > UDC 2>/dev/null; then
+            UDC_FOUND="$UDC_NAME"
+            log "Успешно активирован UDC: $UDC_NAME"
+            break
+        fi
     fi
-else
-    echo "⚠️  Не удалось определить UDC автоматически"
-    echo "🔄 Пробую стандартные варианты..."
+done
+
+# Если не нашли, пробуем стандартные имена
+if [[ -z "$UDC_FOUND" ]]; then
+    log "Поиск UDC по стандартным именам..."
     
-    # Пробуем стандартные варианты
-    for udc_try in "musb-hdrc.4.auto" "musb-hdrc.1.auto" "musb-hdrc" "musb-hdrc.0.auto"; do
-        if echo "$udc_try" > UDC 2>/dev/null; then
-            echo "✅ Гаджет активирован с UDC: $udc_try"
-            UDC_CONTROLLER="$udc_try"
+    for udc_name in "musb-hdrc.4.auto" "musb-hdrc.2.auto" "musb-hdrc.1.auto" "20980000.usb" "dwc2"; do
+        if echo "$udc_name" > UDC 2>/dev/null; then
+            UDC_FOUND="$udc_name"
+            log "Активирован UDC по имени: $udc_name"
             break
         fi
     done
 fi
 
-# Проверяем активацию
-if [ -z "$UDC_CONTROLLER" ] || ! grep -q "$UDC_CONTROLLER" UDC 2>/dev/null; then
-    echo "⚠️  Не удалось активировать гаджет"
-    echo "ℹ️  Проверьте:"
-    echo "   1. Подключен ли кабель к ноутбуку?"
-    echo "   2. Загружены ли модули? (lsmod | grep hid)"
-    echo "   3. dmesg | tail -20"
+if [[ -z "$UDC_FOUND" ]]; then
+    log "Предупреждение: не удалось активировать UDC. Проверьте: ls /sys/class/udc/"
 else
-    echo "📱 UDC контроллер активирован: $(cat UDC 2>/dev/null)"
+    log "UDC контроллер активирован: $UDC_FOUND"
 fi
 
 # Ждем создание устройства
-echo "⏳ Ожидание создания HID устройства..."
-sleep 3
-
-if [ -e /dev/hidg0 ]; then
-    echo "✅ HID клавиатура создана: /dev/hidg0"
-    
-    # Дополнительная проверка
-    echo "🔍 Дополнительные проверки:"
-    ls -la /dev/hidg*
-    echo "📊 Размер дескриптора: $(wc -c < functions/hid.usb0/report_desc) байт"
-else
-    echo "⚠️  /dev/hidg0 не создан"
-    echo "ℹ️  Возможные причины:"
-    echo "   1. Неправильный UDC контроллер"
-    echo "   2. Не загружены модули ядра"
-    echo "   3. Нет подключения к хосту (ноутбуку)"
-    echo "🔧 Попробуйте:"
-    echo "   1. Подключите кабель к ноутбуку"
-    echo "   2. Перезагрузите Orange Pi"
-    echo "   3. Проверьте dmesg: dmesg | tail -30"
-fi
-
-# Сохраняем использованный UDC для логов
-if [ -n "$UDC_CONTROLLER" ]; then
-    echo "💾 Использованный UDC: $UDC_CONTROLLER" > /tmp/last_udc.txt
-fi
-EOF
-
-chmod +x /usr/local/bin/setup_hid.sh
-
-# ================= 6. СОЗДАНИЕ УЛУЧШЕННОЙ ВЕРСИИ С ПРОВЕРКОЙ =================
-print_info "6. Создание улучшенной версии скрипта..."
-
-cat > /usr/local/bin/setup_hid_smart.sh << 'EOF'
-#!/bin/bash
-# Умный скрипт настройки HID с перебором UDC
-
-MAX_ATTEMPTS=3
-ATTEMPT=1
-
-echo "🤖 УМНАЯ НАСТРОЙКА HID КЛАВИАТУРЫ"
-echo "=================================="
-
-while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
-    echo ""
-    echo "🔄 Попытка $ATTEMPT из $MAX_ATTEMPTS"
-    
-    # Выполняем стандартную настройку
-    /usr/local/bin/setup_hid.sh
-    
-    # Проверяем результат
-    if [ -e /dev/hidg0 ]; then
-        echo ""
-        echo "🎉 УСПЕХ! HID устройство создано"
-        echo "📱 Проверьте: ls -la /dev/hidg*"
+for i in {1..10}; do
+    if [[ -e "$HID_DEVICE" ]]; then
+        log "✅ HID устройство успешно создано: $HID_DEVICE"
         exit 0
     fi
-    
-    echo ""
-    echo "⚠️  Попытка $ATTEMPT не удалась"
-    
-    # На последней попытке пробуем ручной перебор UDC
-    if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
-        echo "🔄 Ручной перебор UDC контроллеров..."
-        
-        # Список возможных UDC
-        UDC_CANDIDATES=(
-            "musb-hdrc.4.auto"
-            "musb-hdrc.1.auto" 
-            "musb-hdrc.0.auto"
-            "musb-hdrc"
-            "20980000.usb"
-            "fe800000.usb"
-            "ff400000.usb"
-        )
-        
-        # Пробуем каждый
-        for udc in "${UDC_CANDIDATES[@]}"; do
-            echo "🔧 Пробую UDC: $udc"
-            
-            # Пересоздаем гаджет
-            cd /sys/kernel/config/usb_gadget/ 2>/dev/null && rm -rf g1 2>/dev/null
-            /usr/local/bin/setup_hid.sh 2>/dev/null | grep -q "активирован"
-            
-            # Пробуем активировать с этим UDC
-            if echo "$udc" > /sys/kernel/config/usb_gadget/g1/UDC 2>/dev/null; then
-                echo "✅ UDC $udc принят"
-                sleep 2
-                
-                if [ -e /dev/hidg0 ]; then
-                    echo "🎉 НАЙДЕН РАБОЧИЙ UDC: $udc"
-                    echo "💾 Сохраняю в конфиг..."
-                    echo "WORKING_UDC=\"$udc\"" > /etc/hid_udc.conf
-                    exit 0
-                fi
-            fi
-        done
-    fi
-    
-    ATTEMPT=$((ATTEMPT + 1))
-    sleep 2
+    sleep 0.5
 done
 
-echo ""
-echo "❌ ВСЕ ПОПЫТКИ НЕ УДАЛИСЬ"
-echo "ℹ️  Что делать:"
-echo "   1. Проверьте подключение к ноутбуку"
-echo "   2. Перезагрузите Orange Pi"
-echo "   3. Запустите вручную: dmesg | grep -i udc"
-echo "   4. Посмотрите какие UDC есть: ls /sys/class/udc/"
+log "❌ HID устройство не создано. Проверьте dmesg."
 exit 1
 EOF
+    
+    chmod +x "$hid_script"
+    success "Скрипт настройки HID создан: $hid_script"
+}
 
-chmod +x /usr/local/bin/setup_hid_smart.sh
-
-# ================= 7. СОЗДАНИЕ ГЛАВНОГО РАБОЧЕГО СКРИПТА =================
-print_info "7. Создание главного рабочего скрипта..."
-
-cat > /opt/production_scanner.py << 'EOF'
+# ================= СОЗДАНИЕ ГЛАВНОГО СКРИПТА =================
+create_main_script() {
+    log "Создание главного рабочего скрипта..."
+    
+    local main_script="/opt/production_scanner.py"
+    local segment=$SEGMENT_NUMBER
+    
+    cat > "$main_script" << EOF
 #!/usr/bin/env python3
 """
-🏭 АВТОМАТИЗАЦИЯ ПРОИЗВОДСТВА - ORANGE PI ZERO H3
-📟 Сканер (USB host) → HID клавиатура (USB OTG) → Ноутбук
+🏭 АВТОМАТИЗАЦИЯ ПРОИЗВОДСТВА - PRODUCTION SCANNER
+📟 QR-сканер → HID клавиатура → Станок/Ноутбук
 """
 
 import os
 import sys
 import time
 import serial
-import subprocess
+import re
 from datetime import datetime
 
-# ========== КОНФИГУРАЦИЯ ==========
-SCANNER_PORT = "/dev/ttyUSB0"  # Порт сканера
-HID_DEVICE = "/dev/hidg0"      # HID устройство
-SEGMENT = 1                    # Какой сегмент брать: 0=первый, 1=второй, 2=третий
-DELAY = 5                      # Задержка перед отправкой (секунд)
-LOG_FILE = "/var/log/scanner.log"
+# ================= КОНФИГУРАЦИЯ =================
+SCANNER_PORT = "/dev/ttyUSB0"      # Порт сканера
+SCANNER_BAUDRATE = 9600           # Скорость сканера
+HID_DEVICE = "/dev/hidg0"         # HID устройство
+SEGMENT_NUMBER = $segment         # Сегмент (0, 1, 2)
+LOG_FILE = "/var/log/scanner.log" # Файл логов
 
-# ========== ЛОГГИНГ ==========
+# ================= КАРТА КЛАВИШ =================
+# Расширенная карта HID кодов с поддержкой всех необходимых символов
+HID_KEYMAP = {
+    # Цифры
+    '0': 0x27, '1': 0x1E, '2': 0x1F, '3': 0x20, '4': 0x21,
+    '5': 0x22, '6': 0x23, '7': 0x24, '8': 0x25, '9': 0x26,
+    
+    # Латинские буквы (строчные)
+    'a': 0x04, 'b': 0x05, 'c': 0x06, 'd': 0x07, 'e': 0x08,
+    'f': 0x09, 'g': 0x0A, 'h': 0x0B, 'i': 0x0C, 'j': 0x0D,
+    'k': 0x0E, 'l': 0x0F, 'm': 0x10, 'n': 0x11, 'o': 0x12,
+    'p': 0x13, 'q': 0x14, 'r': 0x15, 's': 0x16, 't': 0x17,
+    'u': 0x18, 'v': 0x19, 'w': 0x1A, 'x': 0x1B, 'y': 0x1C,
+    'z': 0x1D,
+    
+    # Специальные символы (без Shift)
+    '-': 0x2D, '=': 0x2E, '[': 0x2F, ']': 0x30, '\\\\': 0x31,
+    ';': 0x33, "'": 0x34, '`': 0x35, ',': 0x36, '.': 0x37,
+    '/': 0x38,
+    
+    # Специальные символы (с Shift)
+    '_': (0x2D, 0x02),   # Shift + -
+    '+': (0x2E, 0x02),   # Shift + =
+    '{': (0x2F, 0x02),   # Shift + [
+    '}': (0x30, 0x02),   # Shift + ]
+    '|': (0x31, 0x02),   # Shift + \\
+    ':': (0x33, 0x02),   # Shift + ;
+    '"': (0x34, 0x02),   # Shift + '
+    '~': (0x35, 0x02),   # Shift + `
+    '<': (0x36, 0x02),   # Shift + ,
+    '>': (0x37, 0x02),   # Shift + .
+    '?': (0x38, 0x02),   # Shift + /
+    
+    # Цифровые символы с Shift
+    '!': (0x1E, 0x02),   # Shift + 1
+    '@': (0x1F, 0x02),   # Shift + 2
+    '#': (0x20, 0x02),   # Shift + 3
+    '\$': (0x21, 0x02),  # Shift + 4
+    '%': (0x22, 0x02),   # Shift + 5
+    '^': (0x23, 0x02),   # Shift + 6
+    '&': (0x24, 0x02),   # Shift + 7
+    '*': (0x25, 0x02),   # Shift + 8
+    '(': (0x26, 0x02),   # Shift + 9
+    ')': (0x27, 0x02),   # Shift + 0
+    
+    # Управляющие клавиши
+    '\\n': 0x28,  # Enter
+    '\\t': 0x2B,  # Tab
+    ' ': 0x2C,    # Space
+    '\\b': 0x2A,  # Backspace
+}
+
+# ================= ЛОГГИНГ =================
 def log(message, level="INFO"):
+    """Запись лога с timestamp"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_line = f"[{timestamp}] [{level}] {message}"
     
-    # Вывод в консоль с эмодзи
-    if level == "ERROR":
-        print(f"❌ {log_line}")
-    elif level == "WARNING":
-        print(f"⚠️  {log_line}")
-    else:
-        print(f"📝 {log_line}")
+    # Вывод в консоль
+    print(f"📝 {log_line}")
     
     # Запись в файл
     try:
-        with open(LOG_FILE, "a") as f:
-            f.write(log_line + "\n")
-    except:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(log_line + "\\n")
+    except Exception:
         pass
+    
+    return log_line
 
-# ========== HID КЛАВИАТУРА ==========
+# ================= HID КЛАВИАТУРА =================
 class HIDKeyboard:
     def __init__(self, device=HID_DEVICE):
         self.device = device
-        # HID коды для цифр и Enter
-        self.keymap = {
-            '0': 0x27, '1': 0x1E, '2': 0x1F, '3': 0x20, '4': 0x21,
-            '5': 0x22, '6': 0x23, '7': 0x24, '8': 0x25, '9': 0x26,
-            '\n': 0x28,  # Enter
-        }
-    
-    def send_key(self, keycode):
-        """Отправка нажатия одной клавиши"""
+        
+    def send_key(self, keycode, modifiers=0):
+        """Отправка нажатия клавиши"""
         try:
             with open(self.device, "wb") as hid:
-                # HID отчет: 8 байт
-                report = bytes([0, 0, keycode, 0, 0, 0, 0, 0])
+                # Формат HID отчета: 8 байт
+                report = bytes([
+                    modifiers,    # Модификаторы
+                    0x00,         # Reserved
+                    keycode,      # Key 1
+                    0x00, 0x00, 0x00, 0x00, 0x00  # Keys 2-6
+                ])
                 hid.write(report)
                 hid.flush()
-                time.sleep(0.05)
+                time.sleep(0.01)
                 
                 # Отпускаем клавишу
-                report = bytes([0]*8)
-                hid.write(report)
+                hid.write(bytes([0x00] * 8))
                 hid.flush()
-                time.sleep(0.02)
+                time.sleep(0.01)
+            
             return True
         except Exception as e:
             log(f"Ошибка отправки клавиши: {e}", "ERROR")
             return False
     
-    def type_digits(self, digits):
-        """Ввод цифр"""
-        log(f"⌨️  Ввод цифр: {digits}")
+    def type_string(self, text):
+        """Ввод строки с поддержкой всех символов"""
+        log(f"⌨️  Ввод текста: '{text}'")
         
-        for digit in digits:
-            if digit in self.keymap:
-                self.send_key(self.keymap[digit])
-                time.sleep(0.05)
+        for char in text:
+            if char in HID_KEYMAP:
+                # Получаем код клавиши и модификаторы
+                key_info = HID_KEYMAP[char]
+                
+                if isinstance(key_info, tuple):
+                    # Если нужен Shift
+                    keycode, modifiers = key_info
+                else:
+                    # Простая клавиша
+                    keycode = key_info
+                    modifiers = 0x02 if char.isupper() else 0
+                
+                # Отправляем клавишу
+                success = False
+                for attempt in range(3):
+                    if self.send_key(keycode, modifiers):
+                        success = True
+                        break
+                    time.sleep(0.05)
+                
+                if not success:
+                    log(f"⚠️  Не удалось ввести символ: '{char}'", "WARNING")
             else:
-                log(f"⚠️  Пропускаю не-цифру: '{digit}'", "WARNING")
+                log(f"⚠️  Неподдерживаемый символ: '{char}' (код: {ord(char)})", "WARNING")
         
-        # Enter в конце (как сканер)
-        self.send_key(self.keymap['\n'])
+        # Enter в конце (как у сканера)
+        self.send_key(HID_KEYMAP['\\n'])
         log("↵ Enter отправлен")
+        
         return True
 
-# ========== ПАРСИНГ QR ==========
-def parse_qr(qr_string):
-    """Парсит '123;456;789' и возвращает нужный сегмент"""
+# ================= ПАРСИНГ QR =================
+def parse_qr_data(qr_string):
+    """Парсит QR код формата 'сегмент1;сегмент2;сегмент3'"""
     try:
-        parts = qr_string.strip().split(';')
+        log(f"📊 Получен QR код: {qr_string}")
         
-        log(f"📊 Получен QR: {qr_string}")
-        log(f"📊 Сегментов: {len(parts)}")
+        # Убираем лишние пробелы и символы
+        qr_clean = qr_string.strip()
         
-        if len(parts) < 3:
-            log(f"⚠️  Мало сегментов: {len(parts)} (нужно 3)", "WARNING")
+        # Разделяем по точке с запятой
+        segments = qr_clean.split(';')
+        
+        # Проверяем количество сегментов
+        if len(segments) < 3:
+            log(f"⚠️  Мало сегментов: {len(segments)} (нужно 3)", "WARNING")
             return None
         
-        if SEGMENT < len(parts):
-            value = parts[SEGMENT].strip()
+        # Выбираем нужный сегмент
+        if SEGMENT_NUMBER < len(segments):
+            value = segments[SEGMENT_NUMBER].strip()
             
-            # Проверяем что только цифры
-            if value and value.isdigit():
-                log(f"✅ Извлечен сегмент {SEGMENT}: {value}")
+            if value:
+                log(f"✅ Извлечен сегмент {SEGMENT_NUMBER}: '{value}'")
                 return value
             else:
-                log(f"❌ В сегменте не цифры: '{value}'", "ERROR")
+                log(f"⚠️  Пустой сегмент {SEGMENT_NUMBER}", "WARNING")
                 return None
         else:
-            log(f"❌ Нет сегмента номер {SEGMENT}", "ERROR")
+            log(f"❌ Нет сегмента номер {SEGMENT_NUMBER}", "ERROR")
             return None
             
     except Exception as e:
-        log(f"❌ Ошибка парсинга: {e}", "ERROR")
+        log(f"❌ Ошибка парсинга QR: {e}", "ERROR")
         return None
 
-# ========== ЧТЕНИЕ СКАНЕРА ==========
-def read_scanner():
-    """Чтение данных со сканера QR"""
+# ================= ЧТЕНИЕ СО СКАНЕРА =================
+def read_from_scanner():
+    """Чтение данных со сканера QR кодов"""
     try:
         log("📡 Ожидание данных от сканера...")
         
+        # Автопоиск порта сканера
+        port = SCANNER_PORT
+        if not os.path.exists(port):
+            # Ищем возможные порты
+            for possible_port in ["/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyACM0", "/dev/ttyACM1"]:
+                if os.path.exists(possible_port):
+                    port = possible_port
+                    log(f"🔍 Найден сканер на порту: {port}")
+                    break
+        
         with serial.Serial(
-            port=SCANNER_PORT,
-            baudrate=9600,
+            port=port,
+            baudrate=SCANNER_BAUDRATE,
             timeout=1,
             bytesize=serial.EIGHTBITS,
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE
-        ) as ser:
+        ) as scanner:
+            
+            # Сбрасываем буфер
+            scanner.reset_input_buffer()
             
             while True:
-                if ser.in_waiting:
-                    # Читаем строку (сканер обычно отправляет с \r\n)
-                    data = ser.readline().decode('utf-8', errors='ignore').strip()
+                if scanner.in_waiting:
+                    # Читаем строку
+                    try:
+                        data = scanner.readline().decode('utf-8', errors='ignore').strip()
+                    except UnicodeDecodeError:
+                        data = scanner.readline().decode('latin-1', errors='ignore').strip()
                     
                     if data:
-                        log(f"📱 Получено с сканера: {data}")
+                        log(f"📱 Получены данные: {data}")
                         return data
                 
-                time.sleep(0.1)
+                # Небольшая пауза
+                time.sleep(0.01)
                 
     except serial.SerialException as e:
         log(f"❌ Ошибка подключения к сканеру: {e}", "ERROR")
+        log("🔧 Проверьте подключение сканера и порт", "INFO")
         return None
     except Exception as e:
         log(f"❌ Неожиданная ошибка сканера: {e}", "ERROR")
         return None
 
-# ========== ПРОВЕРКА И ВОССТАНОВЛЕНИЕ HID ==========
-def check_and_fix_hid():
-    """Проверка и восстановление HID устройства"""
+# ================= ГЛАВНЫЙ ЦИКЛ =================
+def main():
+    """Основной цикл работы программы"""
     
-    if os.path.exists(HID_DEVICE):
-        log(f"✅ HID устройство готово: {HID_DEVICE}")
-        return True
+    print("=" * 70)
+    print("🏭 АВТОМАТИЗАЦИЯ ПРОИЗВОДСТВА - PRODUCTION SCANNER")
+    print(f"📟 Используется сегмент: {SEGMENT_NUMBER}")
+    print("=" * 70)
     
-    log(f"⚠️  HID устройство не найдено: {HID_DEVICE}", "WARNING")
-    log("🔧 Пробую восстановить HID...")
-    
-    # Пробуем простую настройку
-    result = subprocess.run(["/usr/local/bin/setup_hid.sh"], 
-                          capture_output=True, text=True)
-    log(f"📋 Результат настройки: {result.stdout}")
-    
-    if result.returncode != 0:
-        log(f"❌ Ошибка настройки: {result.stderr}", "ERROR")
-    
-    time.sleep(2)
-    
-    if os.path.exists(HID_DEVICE):
-        log(f"✅ HID восстановлен: {HID_DEVICE}")
-        return True
-    
-    # Пробуем умную настройку
-    log("🔄 Пробую умную настройку...")
-    result = subprocess.run(["/usr/local/bin/setup_hid_smart.sh"],
-                          capture_output=True, text=True)
-    
-    if "НАЙДЕН РАБОЧИЙ UDC" in result.stdout:
-        log("🎉 Найден рабочий UDC!", "INFO")
+    # Проверяем HID устройство
+    if not os.path.exists(HID_DEVICE):
+        log(f"❌ HID устройство не найдено: {HID_DEVICE}", "ERROR")
+        log("🔧 Запускаю настройку HID...", "INFO")
+        os.system("/usr/local/bin/setup_hid_gadget.sh")
         time.sleep(2)
         
-        if os.path.exists(HID_DEVICE):
-            log(f"✅ HID создан после умной настройки")
-            return True
+        if not os.path.exists(HID_DEVICE):
+            log("❌ Не удалось создать HID устройство", "ERROR")
+            return
     
-    log("❌ Не удалось восстановить HID", "ERROR")
-    return False
-
-# ========== ПРОВЕРКА УСТРОЙСТВ ==========
-def check_devices():
-    """Проверка наличия необходимых устройств"""
-    
-    # Проверяем HID
-    if not check_and_fix_hid():
-        return False
-    
-    # Проверяем COM порты
-    com_ports = [f for f in os.listdir('/dev') if f.startswith('ttyUSB') or f.startswith('ttyACM')]
-    if com_ports:
-        log(f"✅ Найдены COM порты: {', '.join(com_ports)}")
-    else:
-        log(f"⚠️  COM порты не найдены", "WARNING")
-        log(f"ℹ️  Подключите сканер к USB порту", "INFO")
-    
-    return True
-
-# ========== ГЛАВНЫЙ ЦИКЛ ==========
-def main():
-    """Главный цикл программы"""
-    
-    print("=" * 70)
-    print("🏭 АВТОМАТИЗАЦИЯ ПРОИЗВОДСТВА - ORANGE PI ZERO H3")
-    print("📟 QR-сканер → HID клавиатура → Станок/Ноутбук")
-    print("=" * 70)
-    
-    # Проверяем устройства
-    if not check_devices():
-        log("❌ Не все устройства готовы", "ERROR")
-        log("ℹ️  Проверьте подключение:", "INFO")
-        log("   1. Сканер → USB порт (большой)", "INFO")
-        log("   2. Ноутбук → microUSB порт", "INFO")
-        log("   3. Перезагрузите Orange Pi", "INFO")
-        return
-    
-    log(f"✅ Все устройства готовы")
-    log(f"⚙️  Конфигурация:")
-    log(f"   Порт сканера: {SCANNER_PORT}")
-    log(f"   Сегмент QR: {SEGMENT} (0=первый, 1=второй, 2=третий)")
-    log(f"   Задержка: {DELAY} секунд")
-    log(f"   Лог файл: {LOG_FILE}")
-    
-    print("\n" + "=" * 70)
-    print("📋 ИНСТРУКЦИЯ ДЛЯ ОПЕРАТОРА:")
-    print("1. Сканер → USB порт (большой)")
-    print("2. Ноутбук → microUSB порт (OTG)")
-    print("3. Курсор в поле ввода программы станка")
-    print("4. Сканируй QR-код: XXX;YYY;ZZZ")
-    print("5. Через 5 сек данные отправятся автоматически")
-    print("=" * 70 + "\n")
+    log(f"✅ HID устройство готово: {HID_DEVICE}")
     
     # Создаем объект клавиатуры
     keyboard = HIDKeyboard()
+    
+    log("🚀 Система готова к работе")
+    log("📋 Просто сканируйте QR коды формата: XXX;YYY;ZZZ")
+    print("\\n" + "=" * 70)
     
     cycle_count = 0
     
     while True:
         cycle_count += 1
-        log(f"♻️  Цикл #{cycle_count} - ожидание QR-кода...")
+        log(f"♻️  Цикл #{cycle_count} - ожидание QR кода...")
         
         try:
-            # 1. Чтение QR-кода
-            qr_data = read_scanner()
+            # 1. Чтение QR кода
+            qr_data = read_from_scanner()
             
             if not qr_data:
-                log("⏭️  Пустые данные от сканера, продолжаю ожидание...")
+                time.sleep(0.1)
                 continue
             
-            # 2. Парсинг QR
-            value = parse_qr(qr_data)
+            # 2. Парсинг
+            value = parse_qr_data(qr_data)
             
             if not value:
-                log("⏭️  Не удалось извлечь значение, жду следующий QR...")
+                log("⏭️  Пропускаю невалидный QR код", "WARNING")
+                time.sleep(0.5)
                 continue
             
-            # 3. Задержка с обратным отсчетом
-            log(f"⏳ Задержка {DELAY} секунд перед отправкой...")
-            for i in range(DELAY, 0, -1):
-                log(f"   Отправка через: {i} сек")
-                time.sleep(1)
+            # 3. Немедленная отправка (без задержки)
+            log(f"🚀 Отправка сегмента на станок: '{value}'")
             
-            # 4. Отправка на станок
-            log(f"🚀 ОТПРАВКА СЕГМЕНТА НА СТАНОК: {value}")
-            
-            success = keyboard.type_digits(value)
+            success = keyboard.type_string(value)
             
             if success:
-                log(f"✅ УСПЕХ! Отправлено: {value}")
-                log(f"✅ Цикл #{cycle_count} завершен успешно")
+                log(f"✅ УСПЕХ! Сегмент отправлен: '{value}'")
             else:
-                log(f"❌ ОШИБКА отправки", "ERROR")
+                log(f"❌ ОШИБКА отправки сегмента", "ERROR")
             
-            # 5. Короткая пауза между циклами
-            log("⏸️  Пауза 2 секунды перед следующим сканированием...")
-            time.sleep(2)
+            # Короткая пауза между циклами
+            time.sleep(0.1)
             
-            print("\n" + "=" * 50)
+            print("\\n" + "─" * 50)
             
         except KeyboardInterrupt:
-            log("🛑 Программа остановлена пользователем")
+            log("🛑 Программа остановлена пользователем", "INFO")
             break
         except Exception as e:
             log(f"💥 КРИТИЧЕСКАЯ ОШИБКА: {e}", "ERROR")
-            time.sleep(5)
+            time.sleep(1)
 
-# ========== ТОЧКА ВХОДА ==========
+# ================= ТОЧКА ВХОДА =================
 if __name__ == "__main__":
-    # Проверяем права
+    # Проверка прав
     if os.geteuid() != 0:
-        print("❌ Запускай с правами root!")
+        print("❌ Запускайте с правами root!")
         print("   sudo python3 /opt/production_scanner.py")
         sys.exit(1)
     
-    # Создаем директорию для логов если нет
+    # Создаем директорию для логов
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
     
-    # Запускаем
+    log("🚀 Запуск Production Scanner", "INFO")
     main()
 EOF
+    
+    chmod +x "$main_script"
+    success "Главный скрипт создан: $main_script"
+}
 
-chmod +x /opt/production_scanner.py
-
-# ================= 8. СОЗДАНИЕ СЕРВИСА ДЛЯ АВТОЗАПУСКА =================
-print_info "8. Создание сервиса для автозапуска..."
-
-cat > /etc/systemd/system/production-scanner.service << EOF
+# ================= СОЗДАНИЕ SYSTEMD СЕРВИСА =================
+create_systemd_service() {
+    log "Создание systemd сервиса..."
+    
+    local service_file="/etc/systemd/system/production-scanner.service"
+    
+    cat > "$service_file" << EOF
 [Unit]
 Description=Production QR Scanner Service
-After=multi-user.target
-Requires=network.target
+After=multi-user.target network.target
+Wants=network.target
+Requires=syslog.service
 
 [Service]
 Type=simple
 User=root
-ExecStartPre=/bin/bash -c "/usr/local/bin/find_udc.sh > /tmp/udc_detected.txt"
-ExecStartPre=/usr/local/bin/setup_hid_smart.sh
+WorkingDirectory=/opt
+
+# Запускаем настройку HID перед основным скриптом
+ExecStartPre=/bin/bash -c "/usr/local/bin/setup_hid_gadget.sh || true"
 ExecStart=/usr/bin/python3 /opt/production_scanner.py
+
+# Перезапуск при ошибках
 Restart=always
-RestartSec=10
+RestartSec=5
+StartLimitInterval=0
+
+# Логирование
 StandardOutput=journal
 StandardError=journal
-Environment=PYTHONUNBUFFERED=1
+SyslogIdentifier=production-scanner
 
-# Лимиты
-LimitCORE=infinity
-LimitNOFILE=65535
-LimitNPROC=65535
+# Безопасность
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+PrivateDevices=false
+ProtectHome=true
+ReadWritePaths=/var/log /opt
 
 [Install]
 WantedBy=multi-user.target
 EOF
+    
+    # Создаем также таймер для проверки состояния
+    local timer_file="/etc/systemd/system/production-scanner.timer"
+    
+    cat > "$timer_file" << EOF
+[Unit]
+Description=Check and restart scanner service periodically
 
-# ================= 9. СОЗДАНИЕ СКРИПТА ДЛЯ РУЧНОГО ТЕСТА =================
-print_info "9. Создание тестового скрипта..."
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
 
-cat > /usr/local/bin/test_scanner.sh << 'EOF'
+[Install]
+WantedBy=timers.target
+EOF
+    
+    # Перезагружаем systemd и включаем сервисы
+    systemctl daemon-reload
+    systemctl enable production-scanner.service
+    systemctl enable production-scanner.timer
+    systemctl start production-scanner.service
+    systemctl start production-scanner.timer
+    
+    success "Systemd сервис создан и запущен"
+}
+
+# ================= СОЗДАНИЕ СКРИПТА ПРОВЕРКИ =================
+create_test_script() {
+    log "Создание тестового скрипта..."
+    
+    local test_script="/usr/local/bin/test-scanner.sh"
+    
+    cat > "$test_script" << 'EOF'
 #!/bin/bash
-# Тестовый скрипт для проверки работы системы
+# Тестовый скрипт для проверки работы Production Scanner
 
-echo "🧪 ТЕСТ СИСТЕМЫ АВТОМАТИЗАЦИИ"
-echo "=============================="
+echo "🧪 ТЕСТ ПРОИЗВОДСТВЕННОГО СКАНЕРА"
+echo "================================"
 
-# Проверка UDC
-echo "1. Проверка UDC контроллеров..."
-UDC_INFO=$(/usr/local/bin/find_udc.sh)
-if [ $? -eq 0 ]; then
-    echo "   ✅ UDC найден: $UDC_INFO"
-else
-    echo "   ❌ UDC не найден"
-fi
-
-# Проверка доступных UDC
-echo "2. Доступные UDC в системе:"
-if [ -d /sys/class/udc ]; then
-    ls /sys/class/udc/ 2>/dev/null | while read udc; do
-        echo "   - $udc"
-    done
-else
-    echo "   ⚠️  Директория /sys/class/udc не существует"
-fi
-
-# Проверка HID
-echo "3. Проверка HID устройства..."
-if [ -e /dev/hidg0 ]; then
+# Проверка HID устройства
+echo "1. Проверка HID устройства..."
+if [[ -e /dev/hidg0 ]]; then
     echo "   ✅ /dev/hidg0 существует"
-    echo "   📊 Информация:"
-    ls -la /dev/hidg*
+    
+    # Тестовая отправка клавиши
+    echo -ne '\x00\x00\x04\x00\x00\x00\x00\x00' | dd of=/dev/hidg0 bs=8 count=1 2>/dev/null
+    sleep 0.1
+    echo -ne '\x00\x00\x00\x00\x00\x00\x00\x00' | dd of=/dev/hidg0 bs=8 count=1 2>/dev/null
+    echo "   ✅ Тестовая клавиша отправлена (A)"
 else
-    echo "   ❌ /dev/hidg0 не найден"
-    echo "   🔄 Пробую создать..."
-    /usr/local/bin/setup_hid_smart.sh
-    sleep 2
+    echo "   ❌ /dev/hidg0 не существует"
+    echo "   Запустите: sudo /usr/local/bin/setup_hid_gadget.sh"
 fi
 
 # Проверка сканера
-echo "4. Проверка COM портов..."
-ls -la /dev/ttyUSB* /dev/ttyACM* 2>/dev/null | head -5 || echo "   ⚠️  COM порты не найдены"
-
-# Проверка Python скрипта
-echo "5. Проверка Python скрипта..."
-if [ -x /opt/production_scanner.py ]; then
-    echo "   ✅ Скрипт найден и исполняемый"
-    python3 -m py_compile /opt/production_scanner.py 2>/dev/null && echo "   ✅ Синтаксис Python OK"
-else
-    echo "   ❌ Скрипт не найден"
-fi
-
-# Проверка сервиса
-echo "6. Проверка сервиса..."
-systemctl is-enabled production-scanner.service >/dev/null 2>&1
-if [ $? -eq 0 ]; then
-    echo "   ✅ Сервис включен в автозагрузку"
-else
-    echo "   ⚠️  Сервис не в автозагрузке"
-fi
-
-systemctl is-active production-scanner.service >/dev/null 2>&1
-if [ $? -eq 0 ]; then
-    echo "   ✅ Сервис запущен"
-else
-    echo "   ⚠️  Сервис не запущен"
-fi
-
-# Проверка логов
-echo "7. Проверка логов..."
-if [ -e /var/log/scanner.log ]; then
-    echo "   ✅ Лог файл существует"
-    echo "   📄 Последние 5 строк лога:"
-    tail -5 /var/log/scanner.log 2>/dev/null || echo "      (пусто)"
-else
-    echo "   ⚠️  Лог файл не найден"
-fi
-
-# Проверка dmesg
-echo "8. Проверка сообщений ядра (последние USB/gadget):"
-dmesg | tail -20 | grep -E "(USB|udc|gadget|hid|musb)" | tail -5 || echo "   (нет сообщений)"
-
 echo ""
-echo "📋 КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ:"
-echo "  sudo systemctl start production-scanner.service    # Запустить"
-echo "  sudo systemctl stop production-scanner.service     # Остановить"
-echo "  sudo systemctl restart production-scanner.service  # Перезапустить"
-echo "  sudo journalctl -u production-scanner.service -f   # Логи в реальном времени"
-echo "  sudo /usr/local/bin/test_scanner.sh                # Этот тест"
-echo "  sudo /usr/local/bin/find_udc.sh                    # Определить UDC"
-echo ""
-echo "🧪 Быстрый тест HID (отправит цифру 1):"
-echo "  sudo bash -c 'echo -ne \"\\x00\\x00\\x1E\\x00\\x00\\x00\\x00\\x00\" > /dev/hidg0; sleep 0.1; echo -ne \"\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\" > /dev/hidg0'"
-echo ""
-echo "🔧 Ручная настройка HID:"
-echo "  sudo /usr/local/bin/setup_hid.sh                   # Простая настройка"
-echo "  sudo /usr/local/bin/setup_hid_smart.sh            # Умная настройка с перебором UDC"
-EOF
-
-chmod +x /usr/local/bin/test_scanner.sh
-
-# ================= 10. СОЗДАНИЕ КОНФИГУРАЦИОННОГО ФАЙЛА =================
-print_info "10. Создание конфигурационного файла..."
-
-cat > /etc/scanner.conf << 'EOF'
-# Конфигурация системы автоматизации производства
-# Orange Pi Zero H3 - QR сканер → HID клавиатура
-
-# Порт сканера (автоматически определится как ttyUSB0 или ttyACM0)
-SCANNER_PORT="/dev/ttyUSB0"
-
-# Какой сегмент QR кода использовать
-# Формат: "123;456;789"
-# 0 = первый сегмент (123)
-# 1 = второй сегмент (456) 
-# 2 = третий сегмент (789)
-SEGMENT_NUMBER=1
-
-# Задержка перед отправкой (секунд)
-DELAY_BEFORE_SEND=5
-
-# Файл логов
-LOG_FILE="/var/log/scanner.log"
-
-# Скорость сканера (обычно 9600 для USB сканеров)
-SCANNER_BAUDRATE=9600
-
-# UDC контроллер (определяется автоматически)
-# Если система не находит правильный UDC, можно задать вручную:
-# UDC_CONTROLLER="musb-hdrc.4.auto"
-# UDC_CONTROLLER="musb-hdrc.1.auto"
-# UDC_CONTROLLER="musb-hdrc"
-
-# ========== СХЕМА ПОДКЛЮЧЕНИЯ ==========
-# 1. Сканер QR → USB порт (большой USB-A)
-# 2. Ноутбук/станок → microUSB порт (OTG)
-# 3. Питание → через GPIO или дополнительный адаптер
-EOF
-
-# ================= 11. ДОБАВЛЕНИЕ UDC В КОНФИГ =================
-print_info "11. Определение UDC и добавление в конфиг..."
-
-# Пробуем определить UDC
-UDC_RESULT=$(/usr/local/bin/find_udc.sh 2>/dev/null)
-if [ $? -eq 0 ] && [ -n "$UDC_RESULT" ]; then
-    print_info "✅ Найден UDC: $UDC_RESULT"
-    echo "# Автоматически определенный UDC" >> /etc/scanner.conf
-    echo "DETECTED_UDC=\"$UDC_RESULT\"" >> /etc/scanner.conf
-else
-    print_warn "⚠️  UDC не определен автоматически"
-    echo "# UDC не определен автоматически" >> /etc/scanner.conf
-    echo "# DETECTED_UDC=\"\"" >> /etc/scanner.conf
-fi
-
-# ================= 12. ВКЛЮЧЕНИЕ АВТОЗАПУСКА =================
-print_info "12. Включение автозапуска..."
-systemctl daemon-reload
-systemctl enable production-scanner.service
-
-# ================= 13. СОЗДАНИЕ ЛОГ-ФАЙЛА =================
-print_info "13. Создание лог-файла..."
-mkdir -p /var/log
-touch /var/log/scanner.log
-chmod 644 /var/log/scanner.log
-
-# ================= 14. ИЗМЕНЕНИЕ НАСТРОЕК СИСТЕМЫ =================
-print_info "14. Настройка системы..."
-
-# Отключаем энергосбережение USB
-if [ -f /etc/rc.local ]; then
-    if ! grep -q "usb_autosuspend" /etc/rc.local; then
-        sed -i '/^exit 0/i\# Отключение энергосбережения USB\necho "0" > /sys/module/usbcore/parameters/autosuspend\n' /etc/rc.local
-    fi
-fi
-
-# ================= 15. ЗАПУСК ТЕСТОВОЙ НАСТРОЙКИ HID =================
-print_info "15. Тестовая настройка HID..."
-echo ""
-print_info "🔧 ПРОБНАЯ НАСТРОЙКА HID..."
-print_info "============================="
-
-/usr/local/bin/setup_hid_smart.sh
-
-# ================= 16. ФИНАЛЬНЫЕ ПРОВЕРКИ =================
-print_info "16. Финальные проверки..."
-
-echo ""
-echo "🔍 ПРОВЕРКА УСТАНОВКИ:"
-echo "======================"
-
-# Проверка 1: UDC определение
-UDC_TEST=$(/usr/local/bin/find_udc.sh 2>/dev/null)
-if [ $? -eq 0 ]; then
-    echo "✅ UDC определен: $UDC_TEST"
-else
-    echo "❌ UDC не определен"
-fi
-
-# Проверка 2: HID устройство
-if [ -e /dev/hidg0 ]; then
-    echo "✅ HID устройство: /dev/hidg0 создано"
-    echo "   📊 Размер: $(ls -la /dev/hidg0 | awk '{print $5}') байт"
-else
-    echo "⚠️  HID устройство не создано"
-    echo "   ℹ️  Оно появится при подключении к ноутбуку"
-fi
-
-# Проверка 3: Скрипты
-SCRIPT_COUNT=0
-for script in /usr/local/bin/setup_hid.sh /usr/local/bin/setup_hid_smart.sh /usr/local/bin/find_udc.sh /usr/local/bin/test_scanner.sh /opt/production_scanner.py; do
-    if [ -x "$script" ]; then
-        SCRIPT_COUNT=$((SCRIPT_COUNT + 1))
+echo "2. Проверка сканера..."
+SCANNER_PORT=""
+for port in /dev/ttyUSB* /dev/ttyACM*; do
+    if [[ -e "$port" ]]; then
+        SCANNER_PORT="$port"
+        echo "   ✅ Найден порт: $port"
+        break
     fi
 done
 
-if [ $SCRIPT_COUNT -eq 5 ]; then
-    echo "✅ Все 5 скриптов созданы и исполняемы"
+if [[ -z "$SCANNER_PORT" ]]; then
+    echo "   ⚠️  Сканер не найден"
 else
-    echo "❌ Проблема со скриптами: $SCRIPT_COUNT/5"
+    echo "   📡 Сканер подключен к: $SCANNER_PORT"
 fi
 
-# Проверка 4: Сервис
-systemctl is-enabled production-scanner.service >/dev/null 2>&1
-if [ $? -eq 0 ]; then
-    echo "✅ Сервис добавлен в автозагрузку"
+# Проверка сервиса
+echo ""
+echo "3. Проверка сервиса..."
+if systemctl is-active --quiet production-scanner.service; then
+    echo "   ✅ Сервис запущен"
 else
-    echo "❌ Проблема с сервисом"
+    echo "   ❌ Сервис не запущен"
+    echo "   Запустите: sudo systemctl start production-scanner.service"
 fi
 
-# Проверка 5: Python библиотеки
-python3 -c "import evdev, serial" 2>/dev/null
-if [ $? -eq 0 ]; then
-    echo "✅ Python библиотеки установлены"
-else
-    echo "❌ Проблема с Python библиотеками"
-fi
+# Проверка логов
+echo ""
+echo "4. Последние логи:"
+journalctl -u production-scanner.service -n 10 --no-pager
 
 echo ""
-print_info "========================================"
-print_info "🎉 УСТАНОВКА ЗАВЕРШЕНА!"
-print_info "========================================"
-echo ""
-echo "📋 ЧТО ДЕЛАТЬ ДАЛЬШЕ:"
-echo "===================="
-echo "1. ПОДКЛЮЧЕНИЕ:"
-echo "   • Сканер → USB порт (большой)"
-echo "   • Ноутбук → microUSB порт (OTG)"
-echo "   • Питание → через адаптер или GPIO"
-echo ""
-echo "2. ЗАПУСК:"
-echo "   • Система запустится автоматически при загрузке"
-echo "   • Или вручную: sudo systemctl start production-scanner.service"
-echo ""
-echo "3. ТЕСТ:"
-echo "   • Запусти тест: sudo /usr/local/bin/test_scanner.sh"
-echo "   • Смотри логи: sudo journalctl -u production-scanner.service -f"
-echo ""
-echo "4. ИСПОЛЬЗОВАНИЕ:"
-echo "   • Открой на ноутбуке блокнот или программу станка"
-echo "   • Установи курсор в поле ввода"
-echo "   • Отсканируй QR-код: XXX;YYY;ZZZ"
-echo "   • Через 5 секунд данные отправятся автоматически"
-echo ""
-echo "5. ЕСЛИ НЕ РАБОТАЕТ:"
-echo "   • Проверь подключение кабелей"
-echo "   • Запусти: sudo /usr/local/bin/setup_hid_smart.sh"
-echo "   • Посмотри: dmesg | tail -30"
-echo "   • Определи UDC: sudo /usr/local/bin/find_udc.sh"
-echo ""
-echo "6. НАСТРОЙКИ:"
-echo "   • Конфиг: /etc/scanner.conf"
-echo "   • Основной скрипт: /opt/production_scanner.py"
-echo "   • UDC определитель: /usr/local/bin/find_udc.sh"
-echo ""
-echo "🚀 ДЛЯ ЗАПУСКА СИСТЕМЫ:"
-echo "   sudo systemctl start production-scanner.service"
-echo ""
-echo "📞 ДЛЯ ДИАГНОСТИКИ:"
-echo "   • Логи: sudo journalctl -u production-scanner.service -f"
-echo "   • UDC: sudo /usr/local/bin/find_udc.sh"
-echo "   • Тест: sudo /usr/local/bin/test_scanner.sh"
-echo ""
-print_info "========================================"
+echo "================================"
+echo "📋 КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ:"
+echo "• Просмотр логов: sudo journalctl -u production-scanner.service -f"
+echo "• Перезапуск: sudo systemctl restart production-scanner.service"
+echo "• Тест HID: sudo /usr/local/bin/setup_hid_gadget.sh"
+echo "• Ручной запуск: sudo python3 /opt/production_scanner.py"
+echo "================================"
+EOF
+    
+    chmod +x "$test_script"
+    success "Тестовый скрипт создан: $test_script"
+}
 
-# ================= 17. ПРЕДЛОЖЕНИЕ ПЕРЕЗАГРУЗИТЬ =================
-echo ""
-read -p "Перезагрузить сейчас? (y/n): " -n 1 -r
-echo ""
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    print_info "Перезагружаюсь..."
-    reboot
-fi
+# ================= ФИНАЛЬНАЯ НАСТРОЙКА =================
+final_setup() {
+    log "Финальная настройка..."
+    
+    # Устанавливаем корректные права на логи
+    mkdir -p /var/log
+    touch /var/log/scanner.log
+    touch /var/log/scanner-install.log
+    chmod 644 /var/log/scanner*.log
+    
+    # Создаем алиас для удобства
+    cat >> /root/.bashrc << 'EOF'
+# Production Scanner aliases
+alias scanner-logs='journalctl -u production-scanner.service -f'
+alias scanner-restart='systemctl restart production-scanner.service'
+alias scanner-status='systemctl status production-scanner.service'
+alias scanner-test='/usr/local/bin/test-scanner.sh'
+EOF
+    
+    # Применяем изменения .bashrc
+    source /root/.bashrc 2>/dev/null || true
+    
+    success "Финальная настройка завершена"
+}
+
+# ================= ОСНОВНОЙ ПРОЦЕСС =================
+main() {
+    echo "╔═══════════════════════════════════════════════════════╗"
+    echo "║         УСТАНОВКА PRODUCTION SCANNER SYSTEM           ║"
+    echo "║         Для Orange Pi Zero H3 / Pi Zero 2W           ║"
+    echo "╚═══════════════════════════════════════════════════════╝"
+    echo ""
+    
+    # Создаем лог файл
+    mkdir -p "$(dirname "$LOG_FILE")"
+    > "$LOG_FILE"
+    
+    # Выполняем все шаги
+    check_prerequisites
+    detect_board
+    install_packages
+    setup_usb_gadget
+    create_hid_script
+    create_main_script
+    create_systemd_service
+    create_test_script
+    final_setup
+    
+    echo ""
+    echo "╔═══════════════════════════════════════════════════════╗"
+    echo "║                УСТАНОВКА ЗАВЕРШЕНА!                  ║"
+    echo "╠═══════════════════════════════════════════════════════╣"
+    echo "║ 📋 КРАТКАЯ ИНСТРУКЦИЯ:                               ║"
+    echo "║                                                     ║"
+    echo "║ 1. Подключите сканер в USB порт                     ║"
+    echo "║ 2. Подключите плату к ноутбуку через microUSB       ║"
+    echo "║ 3. Откройте программу станка на ноутбуке           ║"
+    echo "║ 4. Поставьте курсор в поле ввода                    ║"
+    echo "║ 5. Сканируйте QR коды формата: XXX;YYY;ZZZ          ║"
+    echo "║ 6. Данные будут отправляться автоматически!         ║"
+    echo "║                                                     ║"
+    echo "║ 📊 Используется сегмент номер: $SEGMENT_NUMBER                ║"
+    echo "║    (0=первый, 1=второй, 2=третий)                   ║"
+    echo "║                                                     ║"
+    echo "║ 🔧 КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ:                          ║"
+    echo "║   • test-scanner.sh - проверка системы              ║"
+    echo "║   • scanner-logs - просмотр логов в реальном времени║"
+    echo "║   • scanner-status - статус сервиса                 ║"
+    echo "║   • scanner-restart - перезапуск сервиса            ║"
+    echo "║                                                     ║"
+    if grep -q "Требуется перезагрузка" "$LOG_FILE"; then
+        echo "║ ⚠️   ТРЕБУЕТСЯ ПЕРЕЗАГРУЗКА!                           ║"
+        echo "║    Выполните: sudo reboot                        ║"
+    fi
+    echo "╚═══════════════════════════════════════════════════════╝"
+    echo ""
+    echo "📋 Полный лог установки: $LOG_FILE"
+}
+
+# ================= ЗАПУСК =================
+main "$@"
