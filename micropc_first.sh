@@ -2,8 +2,8 @@
 set -euo pipefail
 
 SEGMENT="${1:-1}"
-if ! [[ "$SEGMENT" =~ ^[0-2]$ ]]; then
-  echo "SEGMENT must be 0, 1 or 2"
+if ! [[ "$SEGMENT" =~ ^[1-3]$ ]]; then
+  echo "Сегмент должен быть от 1 до 3"
   exit 1
 fi
 
@@ -181,7 +181,7 @@ def log(msg):
     with open('/var/log/production_scanner.log', 'a') as f:
         f.write(msg + '\n')
 
-SEGMENT = 1
+SEGMENT = __SEGMENT__
 HID = "/dev/hidg0"
 
 # Базовая карта кодов (без Shift) — расширенный вариант
@@ -304,7 +304,7 @@ for event in dev.read_loop():
                     parts = buf.split(';')
                     log(f"Parts after split: {parts}")
                     if SEGMENT < len(parts):
-                        segment = parts[SEGMENT].strip()
+                        segment = parts[SEGMENT-1].strip()
                         log(f"Transmitting segment {SEGMENT}: '{segment}'")
                         send(segment)
                     buf = ""
@@ -315,6 +315,7 @@ EOF
 
 sed -i "s/__SEGMENT__/$SEGMENT/" /opt/production_scanner.py
 chmod +x /opt/production_scanner.py
+sed -i "s/__SEGMENT__/$SEGMENT/g" /opt/production_scanner.py
 
 ### Systemd
 cat > /etc/systemd/system/hid-gadget.service <<'EOF'
