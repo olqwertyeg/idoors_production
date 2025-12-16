@@ -353,7 +353,7 @@ systemctl daemon-reload
 systemctl enable hid-gadget.service production-scanner.service
 systemctl restart hid-gadget.service production-scanner.service
 
-echo "[✓] UPDATE COMPLETE"
+echo "[✓] Установка завершена"
 if [ "$REBOOT_NEEDED" -eq 1 ]; then
-  echo "[!] REBOOT recommended"
+  echo "[!] ТРЕБУЕТСЯ перезагрузка"
 fi
