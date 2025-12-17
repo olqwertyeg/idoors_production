@@ -525,6 +525,9 @@ class HIDTransmitter:
             else:
                 log(f"Неизвестный символ: '{char}' (код: {ord(char)})", "WARNING")
         
+        #отправка Enter в конце
+        self.send_key(0x28)
+        
         log(f"Отправлено {success_count}/{len(text)} символов")
         return success_count > 0
 
