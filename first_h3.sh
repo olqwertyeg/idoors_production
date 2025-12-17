@@ -1,0 +1,359 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SEGMENT="${1:-1}"
+if ! [[ "$SEGMENT" =~ ^[1-3]$ ]]; then
+  echo "Сегмент должен быть от 1 до 3"
+  exit 1
+fi
+
+LOG=/var/log/production-scanner-install.log
+exec > >(tee -a "$LOG") 2>&1
+echo "[+] Updating Production Scanner (segment=$SEGMENT)"
+
+if [ "$EUID" -ne 0 ]; then
+  echo "Run as sudo"
+  exit 1
+fi
+
+# Модель
+if grep -q "Orange Pi Zero 2W" /proc/device-tree/model 2>/dev/null; then
+  MODEL="Zero2W"
+  MAX_FREQ=1100000
+else
+  MODEL="H3"
+  MAX_FREQ=800000
+fi
+echo "[+] Model: $MODEL, target CPU max: $((MAX_FREQ/1000)) MHz"
+
+### Пакеты
+apt-get update
+for pkg in python3 python3-evdev usbutils linux-cpupower device-tree-compiler logrotate python3-systemd; do
+  if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+    apt-get install -y "$pkg"
+  fi
+done
+
+### CPU limit (idempotent)
+CURRENT_MAX=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 2>/dev/null || echo 0)
+if [ "$CURRENT_MAX" -gt "$MAX_FREQ" ]; then
+  echo "[+] Applying CPU limit"
+  if command -v cpupower >/dev/null; then
+    cpupower frequency-set -g performance
+    cpupower frequency-set --max $((MAX_FREQ / 1000))MHz
+  else
+    for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
+      echo performance > "$cpu/cpufreq/scaling_governor" 2>/dev/null || true
+      echo "$MAX_FREQ" > "$cpu/cpufreq/scaling_max_freq" 2>/dev/null || true
+    done
+  fi
+else
+  echo "[+] CPU limit already applied"
+fi
+
+# CPU service
+cat > /etc/systemd/system/cpu-limit.service <<EOF
+[Unit]
+Description=Limit CPU frequency
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'if command -v cpupower >/dev/null; then cpupower frequency-set -g performance; cpupower frequency-set --max $((MAX_FREQ / 1000))MHz; else for cpu in /sys/devices/system/cpu/cpu[0-9]*; do echo performance > \$cpu/cpufreq/scaling_governor 2>/dev/null || true; echo $MAX_FREQ > \$cpu/cpufreq/scaling_max_freq 2>/dev/null || true; done; fi'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now cpu-limit.service
+
+### Overlays
+REBOOT_NEEDED=0
+if [ -f /boot/armbianEnv.txt ]; then
+  if ! grep -q "usb0-device" /boot/armbianEnv.txt; then
+    if grep -q "^overlays=" /boot/armbianEnv.txt; then
+      sed -i 's/\(overlays=.*\)/\1 usb0-device/' /boot/armbianEnv.txt
+    else
+      echo "overlays=usb0-device" >> /boot/armbianEnv.txt
+    fi
+    REBOOT_NEEDED=1
+  fi
+fi
+modprobe libcomposite configfs 2>/dev/null || true
+
+### Blacklist g_serial
+if [ ! -f /etc/modprobe.d/g_serial.conf ]; then
+  echo "blacklist g_serial" > /etc/modprobe.d/g_serial.conf
+  REBOOT_NEEDED=1
+fi
+
+### Logrotate
+cat > /etc/logrotate.d/production_scanner <<'EOF'
+/var/log/production_scanner.log /var/log/hid-gadget.log {
+  daily
+  rotate 7
+  compress
+  missingok
+  notifempty
+  create 0644 root root
+}
+EOF
+
+### HID setup
+cat > /usr/local/bin/setup_hid.sh <<'EOF'
+#!/bin/bash
+set -u
+G=/sys/kernel/config/usb_gadget/hid_keyboard
+LOG=/var/log/hid-gadget.log
+echo "[hid] $(date)" >>"$LOG"
+
+rmmod g_serial 2>>"$LOG" || true
+modprobe libcomposite configfs 2>>"$LOG" || true
+
+for i in {1..20}; do
+  mountpoint -q /sys/kernel/config && break
+  mount -t configfs none /sys/kernel/config 2>>"$LOG" || true
+  sleep 0.2
+done
+
+UDC=""
+for i in {1..30}; do
+  UDC=$(ls /sys/class/udc 2>>"$LOG" | head -n1 || true)
+  [ -n "$UDC" ] && break
+  sleep 0.2
+done
+if [ -z "$UDC" ]; then
+  echo "ERROR: no UDC" >>"$LOG"
+  exit 0
+fi
+
+rm -rf "$G" 2>>"$LOG" || true
+mkdir -p "$G" 2>>"$LOG" || true
+cd "$G"
+
+if [ -f UDC ] && [ -s UDC ]; then
+  echo "" > UDC 2>>"$LOG"
+  sleep 0.3
+fi
+
+echo 0x1d6b > idVendor 2>>"$LOG"
+echo 0x0104 > idProduct 2>>"$LOG"
+mkdir -p strings/0x409 2>>"$LOG"
+echo Production > strings/0x409/manufacturer 2>>"$LOG"
+echo QR-Scanner > strings/0x409/product 2>>"$LOG"
+echo 0001 > strings/0x409/serialnumber 2>>"$LOG"
+mkdir -p configs/c.1/strings/0x409 2>>"$LOG"
+echo HID > configs/c.1/strings/0x409/configuration 2>>"$LOG"
+echo 250 > configs/c.1/MaxPower 2>>"$LOG"
+mkdir -p functions/hid.usb0 2>>"$LOG"
+echo 0 > functions/hid.usb0/protocol 2>>"$LOG"
+echo 0 > functions/hid.usb0/subclass 2>>"$LOG"
+echo 64 > functions/hid.usb0/report_length 2>>"$LOG"
+echo -ne '\x05\x01\x09\x06\xa1\x01\x05\x07\x19\xe0\x29\xe7\x15\x00\x25\x01\x75\x01\x95\x08\x81\x02\x95\x01\x75\x08\x81\x03\x95\x05\x75\x01\x05\x08\x19\x01\x29\x05\x91\x02\x95\x01\x75\x03\x91\x03\x95\x06\x75\x08\x15\x00\x25\x65\x05\x07\x19\x00\x29\x65\x81\x00\xc0' > functions/hid.usb0/report_desc 2>>"$LOG"
+ln -sf functions/hid.usb0 configs/c.1/ 2>>"$LOG" || true
+
+for i in {1..10}; do
+  echo "$UDC" > UDC 2>>"$LOG" && { echo "bound $UDC" >>"$LOG"; exit 0; }
+  sleep 0.3
+done
+echo "WARN: failed to bind" >>"$LOG"
+exit 0
+EOF
+chmod +x /usr/local/bin/setup_hid.sh
+
+### Udev
+cat > /etc/udev/rules.d/99-production-scanner.rules <<'EOF'
+SUBSYSTEM=="input", KERNEL=="event*", MODE="0660", GROUP="plugdev"
+EOF
+udevadm control --reload 2>/dev/null || true
+
+### Python script with watchdog pings and logging
+cat > /opt/production_scanner.py <<'EOF'
+#!/usr/bin/env python3
+import evdev
+from evdev import ecodes
+import os
+import time
+import systemd.daemon
+
+def log(msg):
+    with open('/var/log/production_scanner.log', 'a') as f:
+        f.write(msg + '\n')
+
+SEGMENT = __SEGMENT__
+HID = "/dev/hidg0"
+
+# Базовая карта кодов (без Shift) — расширенный вариант
+keymap_no_shift = {
+    2: '1', 3: '2', 4: '3', 5: '4', 6: '5', 7: '6', 8: '7', 9: '8', 10: '9', 11: '0',
+    30: 'a', 48: 'b', 46: 'c', 32: 'd', 18: 'e', 33: 'f', 34: 'g', 35: 'h', 23: 'i',
+    36: 'j', 37: 'k', 38: 'l', 50: 'm', 49: 'n', 24: 'o', 25: 'p', 16: 'q', 19: 'r',
+    31: 's', 20: 't', 22: 'u', 47: 'v', 17: 'w', 45: 'x', 21: 'y', 44: 'z',
+    28: '\n', 57: ' ', 12: '-', 13: '=', 26: '[', 27: ']', 43: '\\',
+    39: ';', 40: "'", 41: '`', 51: ',', 52: '.', 53: '/',
+    # Keypad
+    79: '1', 80: '2', 81: '3', 75: '4', 76: '5', 77: '6', 71: '7', 72: '8', 73: '9', 82: '0',
+    83: '.', 74: '-', 78: '+', 55: '*', 98: '/'
+}
+
+# Карта с Shift — расширенный вариант
+keymap_shift = {
+    2: '!', 3: '@', 4: '#', 5: '$', 6: '%', 7: '^', 8: '&', 9: '*', 10: '(', 11: ')',
+    30: 'A', 48: 'B', 46: 'C', 32: 'D', 18: 'E', 33: 'F', 34: 'G', 35: 'H', 23: 'I',
+    36: 'J', 37: 'K', 38: 'L', 50: 'M', 49: 'N', 24: 'O', 25: 'P', 16: 'Q', 19: 'R',
+    31: 'S', 20: 'T', 22: 'U', 47: 'V', 17: 'W', 45: 'X', 21: 'Y', 44: 'Z',
+    12: '_', 13: '+', 26: '{', 27: '}', 43: '|',
+    39: ':', 40: '"', 41: '~', 51: '<', 52: '>', 53: '?', 55: '*'
+}
+
+# HID коды для базовых символов
+KEYMAP = {
+    'a': 0x04, 'b': 0x05, 'c': 0x06, 'd': 0x07, 'e': 0x08, 'f': 0x09, 'g': 0x0a, 'h': 0x0b,
+    'i': 0x0c, 'j': 0x0d, 'k': 0x0e, 'l': 0x0f, 'm': 0x10, 'n': 0x11, 'o': 0x12, 'p': 0x13,
+    'q': 0x14, 'r': 0x15, 's': 0x16, 't': 0x17, 'u': 0x18, 'v': 0x19, 'w': 0x1a, 'x': 0x1b,
+    'y': 0x1c, 'z': 0x1d,
+    '1': 0x1e, '2': 0x1f, '3': 0x20, '4': 0x21, '5': 0x22, '6': 0x23, '7': 0x24, '8': 0x25,
+    '9': 0x26, '0': 0x27,
+    '-': 0x2d, '=': 0x2e, '[': 0x2f, ']': 0x30, '\\': 0x31,
+    ';': 0x33, '\'': 0x34, '`': 0x35, ',': 0x36, '.': 0x37, '/': 0x38,
+    ' ': 0x2c, '\n': 0x28
+}
+
+# Маппинг для сдвинутых символов
+SHIFT_MAP = {
+    '!': (0x1e, 0x02), '@': (0x1f, 0x02), '#': (0x20, 0x02), '$': (0x21, 0x02), '%': (0x22, 0x02),
+    '^': (0x23, 0x02), '&': (0x24, 0x02), '*': (0x25, 0x02), '(': (0x26, 0x02), ')': (0x27, 0x02),
+    '_': (0x2d, 0x02), '+': (0x2e, 0x02), '{': (0x2f, 0x02), '}': (0x30, 0x02), '|': (0x31, 0x02),
+    ':': (0x33, 0x02), '"': (0x34, 0x02), '~': (0x35, 0x02), '<': (0x36, 0x02), '>': (0x37, 0x02),
+    '?': (0x38, 0x02),
+    'A': (0x04, 0x02), 'B': (0x05, 0x02), 'C': (0x06, 0x02), 'D': (0x07, 0x02), 'E': (0x08, 0x02),
+    'F': (0x09, 0x02), 'G': (0x0a, 0x02), 'H': (0x0b, 0x02), 'I': (0x0c, 0x02), 'J': (0x0d, 0x02),
+    'K': (0x0e, 0x02), 'L': (0x0f, 0x02), 'M': (0x10, 0x02), 'N': (0x11, 0x02), 'O': (0x12, 0x02),
+    'P': (0x13, 0x02), 'Q': (0x14, 0x02), 'R': (0x15, 0x02), 'S': (0x16, 0x02), 'T': (0x17, 0x02),
+    'U': (0x18, 0x02), 'V': (0x19, 0x02), 'W': (0x1a, 0x02), 'X': (0x1b, 0x02), 'Y': (0x1c, 0x02),
+    'Z': (0x1d, 0x02)
+}
+
+# Маппинг keypad → символы
+KEYPAD_CHAR = {
+    'kp0': '0', 'kp1': '1', 'kp2': '2', 'kp3': '3', 'kp4': '4',
+    'kp5': '5', 'kp6': '6', 'kp7': '7', 'kp8': '8', 'kp9': '9',
+    'kpdot': '.', 'kpenter': '\n', 'kpplus': '+', 'kpminus': '-',
+    'kpmultiply': '*', 'kpdivide': '/', 'kpasterisk': '*'
+}
+
+def send_key(code, modifier=0):
+    try:
+        with open(HID, 'wb', buffering=0) as h:
+            h.write(bytes([modifier, 0, code, 0,0,0,0,0]))
+            time.sleep(0.01)
+            h.write(b'\x00'*8)
+            time.sleep(0.01)
+    except Exception as e:
+        log(f"Key send error: {e}")
+
+def send(text):
+    log(f"Sending exactly: '{text}'")
+    for c in text:
+        if c in SHIFT_MAP:
+            k, m = SHIFT_MAP[c]
+            send_key(k, m)
+        elif c in KEYMAP:
+            send_key(KEYMAP[c])
+        else:
+            log(f"Unknown char: '{c}' (code fallback)")
+            # Fallback на цифру/букву
+            send_key(ord(c.lower()) - ord('a') + 4 if c.isalpha() else 0)
+
+paths = evdev.list_devices()
+if not paths:
+    log("No devices")
+    os._exit(1)
+
+devices = [evdev.InputDevice(p) for p in paths]
+dev = next((d for d in devices if ecodes.EV_KEY in d.capabilities() and ('hid' in d.name.lower() or 'scanner' in d.name.lower())), devices[0])
+log(f"Using: {dev.name} ({dev.path})")
+
+systemd.daemon.notify('READY=1')
+
+buf = ""
+shift = False
+
+for event in dev.read_loop():
+    systemd.daemon.notify('WATCHDOG=1')
+    if event.type == ecodes.EV_KEY:
+        #log(f"Event: code {event.code} value {event.value}")
+        if event.code in [42, 54]:  # LeftShift, RightShift
+            shift = (event.value == 1)
+            continue
+        if event.value == 1:  # Key press
+            key_name = ecodes.KEY.get(event.code, '').replace('KEY_', '').lower()
+            char = ''
+            if key_name.startswith('kp'):  # Keypad keys
+                char = KEYPAD_CHAR.get(key_name, '')
+            else:
+                if shift:
+                    char = keymap_shift.get(event.code, '')
+                if not char:
+                    char = keymap_no_shift.get(event.code, '')
+            if char:
+                if char == '\n':
+                    log(f"Enter detected, raw buffer: '{buf}'")
+                    # Разделение только по точке с запятой
+                    parts = buf.split(';')
+                    log(f"Parts after split: {parts}")
+                    if SEGMENT < len(parts):
+                        segment = parts[SEGMENT-1].strip()
+                        log(f"Transmitting segment {SEGMENT}: '{segment}'")
+                        send(segment)
+                    buf = ""
+                else:
+                    buf += char
+                    log(f"Buffer now: '{buf}'")
+EOF
+
+sed -i "s/__SEGMENT__/$SEGMENT/" /opt/production_scanner.py
+chmod +x /opt/production_scanner.py
+sed -i "s/__SEGMENT__/$SEGMENT/g" /opt/production_scanner.py
+
+### Systemd
+cat > /etc/systemd/system/hid-gadget.service <<'EOF'
+[Unit]
+Description=USB HID Gadget
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/bash -c "/sbin/rmmod g_serial || true"
+ExecStart=/usr/local/bin/setup_hid.sh
+RemainAfterExit=yes
+WatchdogSec=60
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /etc/systemd/system/production-scanner.service <<'EOF'
+[Unit]
+Description=Production QR Scanner
+After=hid-gadget.service
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/production_scanner.py
+Restart=always
+RestartSec=2
+WatchdogSec=60
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable hid-gadget.service production-scanner.service
+systemctl restart hid-gadget.service production-scanner.service
+
+echo "[✓] Установка завершена"
+if [ "$REBOOT_NEEDED" -eq 1 ]; then
+  echo "[!] ТРЕБУЕТСЯ перезагрузка"
+fi
