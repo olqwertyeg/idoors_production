@@ -348,7 +348,7 @@ import subprocess
 from pathlib import Path
 
 # Конфигурация
-SEGMENT = $SEGMENT
+SEGMENT = %%SEGMENT%%
 HID_DEVICE = "/dev/hidg0"
 LOG_FILE = "/var/log/production_scanner.log"
 SCANNER_TIMEOUT = 30  # секунд для ожидания сканера
@@ -755,6 +755,7 @@ if __name__ == "__main__":
     main()
 EOF
 
+sed -i "s/%%SEGMENT%%/$SEGMENT/g" /opt/production_scanner.py
 chmod +x /opt/production_scanner.py
 
 # Устанавливаем зависимости Python
